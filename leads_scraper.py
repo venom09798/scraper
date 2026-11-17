@@ -1,15 +1,21 @@
 """
-Leads Scraper — Flask version
-Same logic as original. Setup form in browser, scrape runs in background.
+Leads Scraper — Flask version (Railway / Docker ready)
+Setup form in browser, scrape runs in background.
 
 Sources : Google Maps + Google / DuckDuckGo fallback
 Output  : UK_Leads.xlsx + optional CRM
 
-Run:
+Environment variables (Railway -> Variables):
+  CRM_API_KEY   your CRM API key (required for CRM sync)
+  CRM_API_URL   optional, overrides the CRM endpoint
+  DATA_DIR      optional, folder for the Excel file (set to /data when a Volume is mounted there)
+  PORT          set by Railway automatically
+
+Run locally:
   pip install flask pandas openpyxl requests playwright
   playwright install chromium
-  python leads_scraper_flask.py
-  → http://127.0.0.1:5000
+  python leads_scraper.py
+  -> http://127.0.0.1:5000
 """
 from playwright.sync_api import sync_playwright
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -24,6 +30,38 @@ import time
 import re
 import os
 import sys
+
+# ── job state + live logging (every print() also goes to the web page) ─────
+_job_lock = Lock()
+_job = {
+    "running": False,
+    "stop": False,
+    "log": [],
+    "stats": {"saved": 0, "queries_done": 0, "queries_total": 0},
+    "config_summary": "",
+    "error": None,
+}
+
+_real_print = print
+
+
+def print(*args, **kwargs):  # noqa: A001  (intentionally shadows the builtin)
+    """Print to the server log (unbuffered) AND to the web status page."""
+    kwargs.pop("flush", None)
+    try:
+        _real_print(*args, flush=True, **kwargs)
+    except Exception:
+        pass
+    msg = kwargs.get("sep", " ").join(str(a) for a in args)
+    with _job_lock:
+        _job["log"].append(msg)
+        if len(_job["log"]) > 400:
+            _job["log"] = _job["log"][-300:]
+
+
+def job_print(msg):
+    print(msg)
+
 
 SERVICES = [
     "freelance web designer",
@@ -333,7 +371,11 @@ REGIONS = {
 
 ACTIVE_REGIONS = ["UK", "Australia", "Canada", "USA", "Pakistan", "Qatar"]
 
-EXTRA_LOCATIONS_FILE = "extra_locations.txt"
+# ── data folder (use a Railway Volume: mount it at /data and set DATA_DIR=/data) ──
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+EXTRA_LOCATIONS_FILE = os.path.join(DATA_DIR, "extra_locations.txt")
 
 
 def build_locations():
@@ -367,7 +409,7 @@ INDUSTRY_OPTIONS = {
     "12": ("Events & photography", ["wedding planner", "photographer", "event planner", "catering service", "florist"]),
     "13": ("Legal, finance & travel", ["lawyer", "accountant", "tax consultant", "insurance agent", "travel agent"]),
 }
-CUSTOM_KEY = "14" 
+CUSTOM_KEY = "14"
 
 SERVICE_OPTIONS = {
     "1": "SEO",
@@ -375,10 +417,9 @@ SERVICE_OPTIONS = {
     "3": "Social Media Marketing",
 }
 
-LEAD_FILTER = "no_website"  
-SEARCH_TERMS = [(s, "Web / SEO / Marketing businesses") for s in SERVICES] 
+LEAD_FILTER = "no_website"
+SEARCH_TERMS = [(s, "Web / SEO / Marketing businesses") for s in SERVICES]
 OFFER_SERVICES = list(SERVICE_OPTIONS.values())
-
 
 
 def configure_from_form(lead_choice, region_picks, industry_picks, custom_terms, offer_picks):
@@ -387,7 +428,6 @@ def configure_from_form(lead_choice, region_picks, industry_picks, custom_terms,
     LEAD_FILTER = "no_website" if lead_choice == "1" else "with_website"
 
     region_names = list(REGIONS)
-    # region_picks are region names (UK, Australia, ...)
     ACTIVE_REGIONS = [r for r in region_picks if r in REGIONS] or region_names[:1]
     LOCATIONS = build_locations()
 
@@ -402,7 +442,7 @@ def configure_from_form(lead_choice, region_picks, industry_picks, custom_terms,
 
     OFFER_SERVICES = [SERVICE_OPTIONS[k] for k in offer_picks if k in SERVICE_OPTIONS] or list(SERVICE_OPTIONS.values())
 
-    print("\\n✅ Setup done")
+    print("\n✅ Setup done")
     print(f"   Lead type : {LEAD_TYPE_OPTIONS.get(lead_choice, lead_choice)}")
     print(f"   Regions   : {', '.join(ACTIVE_REGIONS)} ({len(LOCATIONS)} locations)")
     print(f"   Industries: {', '.join(dict.fromkeys(lbl for _, lbl in SEARCH_TERMS))}")
@@ -413,12 +453,14 @@ def notes_text(industry):
     return f"Industry: {industry} | Offer: {', '.join(OFFER_SERVICES)}"
 
 
-MAX_SCROLLS = 15                   
+MAX_SCROLLS = 15
 MAX_PLACES_PER_QUERY = 80
 HEADLESS = True
-OUTPUT_EXCEL = "UK_Leads.xlsx"      
-DELAY = 5                           
-SAVE_EVERY = 5                      
+OUTPUT_EXCEL = os.path.join(DATA_DIR, "UK_Leads.xlsx")
+SEED_EXCEL = "UK_Leads.xlsx"        # copy shipped in the repo, used once to seed an empty /data volume
+DEBUG_SHOT = os.path.join(DATA_DIR, "debug.png")
+DELAY = 5
+SAVE_EVERY = 5
 
 
 ONLY_WITH_CONTACT = True
@@ -430,9 +472,9 @@ SEARCH_ENGINES = ["google", "duckduckgo"]
 FALLBACK_MAX_RESULTS = 15
 
 API_ENABLED = True
-API_URL = "https://crm.rhoflow.net/api/external/leads"
-API_KEY = os.getenv("CRM_API_KEY") or "f33f43afb069e63f3ab24b0ee3d121275736ccae9531ef54"
-API_KEY_HEADER = "X-API-Key"     
+API_URL = os.getenv("CRM_API_URL", "https://crm.rhoflow.net/api/external/leads")
+API_KEY = os.getenv("CRM_API_KEY", "").strip()       # set CRM_API_KEY in Railway Variables
+API_KEY_HEADER = "X-API-Key"
 PAYLOAD_MODE = "single"
 
 CRM_FIELD_MAP = {
@@ -477,7 +519,7 @@ FIELDS = list(FIELD_TO_HEADER.keys())
 STATE_SHEET = "_state"
 STATE_COLS = ["key", "place_id", "crm_synced"]
 QUERY_PREFIX = "QUERY|"
-BACKUP_FILE = "UK_Leads_old_backup.xlsx"
+BACKUP_FILE = os.path.join(DATA_DIR, "UK_Leads_old_backup.xlsx")
 
 EMAIL_RE = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
 BAD_EMAIL_WORDS = ["example", "sentry", "wix", "wordpress", "domain",
@@ -563,7 +605,7 @@ def _read_sheet(sheet):
             print(f"⚠️ {OUTPUT_EXCEL} is open in Excel. Close it, retrying in 10 seconds...")
             time.sleep(10)
         except ValueError:
-            return None          
+            return None
         except Exception as e:
             print(f"❌ Could not read {OUTPUT_EXCEL}: {e}")
             print("   The file may be corrupted. Make a backup and delete or repair it.")
@@ -622,6 +664,11 @@ def write_data(leads, state):
 
 def create_empty_excel():
     if not os.path.exists(OUTPUT_EXCEL):
+        # First run on a fresh volume: start from the Excel shipped in the repo (keeps old leads / resume)
+        if os.path.exists(SEED_EXCEL) and os.path.abspath(SEED_EXCEL) != os.path.abspath(OUTPUT_EXCEL):
+            shutil.copy2(SEED_EXCEL, OUTPUT_EXCEL)
+            print(f"📋 Copied {SEED_EXCEL} -> {OUTPUT_EXCEL} (first run on this data folder)")
+            return
         write_data(empty_leads(), empty_state())
         print(f"✅ Empty Excel created → {OUTPUT_EXCEL}")
 
@@ -706,12 +753,14 @@ def save_leads(leads, quiet=False):
 
     write_data(leads_df, state_df)
     print(f"💾 Excel saved | +{len(fresh)} new | Total: {len(leads_df)}")
+    with _job_lock:
+        _job["stats"]["saved"] += len(fresh)
     sync_to_crm()          # send the new leads to the CRM right away
     return fresh
 
 
-OK_CODES = (200, 201, 202)    
-DUPLICATE_CODE = 409 
+OK_CODES = (200, 201, 202)
+DUPLICATE_CODE = 409
 
 
 def _crm_headers(style=None):
@@ -729,7 +778,7 @@ def _crm_payload(row):
     payload = {crm_field: row.get(src, "") for src, crm_field in CRM_FIELD_MAP.items()}
     payload["status"] = (payload.get("status") or "New").strip().lower()
     if not valid_email(payload.get("email")):
-        payload["email"] = "" 
+        payload["email"] = ""
     return payload
 
 
@@ -756,8 +805,8 @@ def sync_to_crm():
     sent leads are never sent twice. Every reply is printed / logged so problems are visible."""
     if not API_ENABLED:
         return
-    if "PASTE_" in API_URL or "PASTE_" in API_KEY or not API_KEY:
-        print("⚠️ CRM URL / API key is not set, CRM sync skipped (data is saved in Excel).")
+    if not API_KEY or "PASTE_" in API_URL:
+        print("⚠️ CRM_API_KEY / CRM URL is not set, CRM sync skipped (data is saved in Excel).")
         return
 
     leads_df, state_df = load_data()
@@ -769,6 +818,8 @@ def sync_to_crm():
     pending = [(i, k) for i, k in zip(leads_df.index, keys) if smap.get(k, ["", "No"])[1] != "Yes"]
     if not pending:
         return
+
+    print(f"📡 CRM: sending {len(pending)} pending leads...")
 
     def mark(k):
         smap.setdefault(k, ["", "No"])[1] = "Yes"
@@ -792,12 +843,14 @@ def sync_to_crm():
                 failed = len(pending)
         else:
             for i, k in pending:
+                if _job.get("stop"):
+                    break
                 row = leads_df.loc[i].to_dict()
-                r = requests.post(API_URL, json=_crm_payload(row), headers=headers, timeout=30)
+                r = requests.post(API_URL, json=_crm_payload(row), headers=headers, timeout=15)
                 if r.status_code == 422 and "email" in r.text.lower() and row.get("email"):
                     retry = _crm_payload(row)
                     retry["email"] = ""
-                    r = requests.post(API_URL, json=retry, headers=headers, timeout=30)
+                    r = requests.post(API_URL, json=retry, headers=headers, timeout=15)
                     if r.status_code in OK_CODES:
                         print(f"   ✉️  {row['name'][:35]}: CRM rejected the email, lead sent without it")
                 outcome = _crm_outcome(r)
@@ -809,18 +862,18 @@ def sync_to_crm():
                     duplicates += 1
                     print(f"   ♻️  {row['name'][:35]}: CRM says it already exists (409)")
                 elif outcome == "auth":
-                    print(f"❌ CRM rejected the API key ({r.status_code}). Check API_KEY / API_KEY_HEADER.")
+                    print(f"❌ CRM rejected the API key ({r.status_code}). Check CRM_API_KEY / API_KEY_HEADER.")
                     failed += 1
                     break
                 else:
                     failed += 1
                     print(f"❌ {row['name'][:35]}: CRM error {r.status_code} {clean(r.text)[:150]}")
                 if (created + duplicates) and (created + duplicates) % 25 == 0:
-                    write_data(leads_df, state_now()) 
+                    write_data(leads_df, state_now())
                 time.sleep(0.2)
     except requests.exceptions.RequestException as e:
         print(f"❌ Could not connect to the CRM: {str(e)[:150]}")
-        print("   Check the internet / VPN and API_URL. Run  python leads_scraper.py --crm-test  to diagnose.")
+        print(f"   Check CRM_API_URL ({API_URL}). Run  python leads_scraper.py --crm-test  to diagnose.")
     except Exception as e:
         print(f"❌ CRM sync error: {str(e)[:150]}")
     finally:
@@ -1168,6 +1221,8 @@ def web_fallback(page, service, city, seen_ids, seen_keys, industry=""):
 
     city_token = city.split(",")[0].strip().lower()
     for root, (plat, name, snippet) in candidates.items():
+        if _job.get("stop"):
+            break
         pid = place_id(root)
         if pid in seen_ids or not name:
             continue
@@ -1183,7 +1238,7 @@ def web_fallback(page, service, city, seen_ids, seen_keys, industry=""):
             alltext = snippet + "\n" + body
 
             if city_token and city_token not in alltext.lower():
-                seen_ids.add(pid)                    
+                seen_ids.add(pid)
                 continue
             if mentions_own_website(alltext):
                 seen_ids.add(pid)
@@ -1259,8 +1314,17 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
                     places.append(clean_url)
 
         print(f"   Found {len(places)} places")
+        if not places:
+            # Diagnostic: what did Google actually show? (open /debug on the web page to see the screenshot)
+            try:
+                print(f"   ⚠️ No places. URL: {page.url[:90]} | Title: {page.title()[:60]}")
+                page.screenshot(path=DEBUG_SHOT)
+            except Exception:
+                pass
 
         for i, place_url in enumerate(places[:MAX_PLACES_PER_QUERY]):
+            if _job.get("stop"):
+                break
             pid = place_id(place_url)
             if pid in seen_ids:
                 continue
@@ -1378,7 +1442,7 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
                 print(f"   [{i+1}] ❌ error: {str(e)[:80]}")
                 continue
 
-        completed = bool(places)
+        completed = bool(places) and not _job.get("stop")
 
     except Exception as e:
         print(f"❌ Failed: {str(e)[:80]}")
@@ -1390,27 +1454,6 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
           f"no contact found {stats['no_contact']} | "
           f"skipped (other lead type) {stats['skipped_filter']}")
     return leads, completed
-
-
-
-# ── job state for web UI ───────────────────────────────────────────────────
-_job_lock = Lock()
-_job = {
-    "running": False,
-    "stop": False,
-    "log": [],
-    "stats": {"saved": 0, "queries_done": 0, "queries_total": 0},
-    "config_summary": "",
-    "error": None,
-}
-
-
-def job_print(msg):
-    print(msg)
-    with _job_lock:
-        _job["log"].append(msg)
-        if len(_job["log"]) > 400:
-            _job["log"] = _job["log"][-300:]
 
 
 def run_scrape_job():
@@ -1432,7 +1475,8 @@ def run_scrape_job():
         job_print("=" * 60)
         job_print(f"Leads Scraper - {'businesses WITHOUT a website' if LEAD_FILTER == 'no_website' else 'businesses WITH a website'}")
         job_print(f"Regions: {', '.join(ACTIVE_REGIONS)} | Locations: {len(LOCATIONS)} | Search terms: {len(SEARCH_TERMS)}")
-        job_print(f"CRM sync: {'ON' if API_ENABLED else 'OFF'}")
+        job_print(f"CRM sync: {'ON' if (API_ENABLED and API_KEY) else 'OFF (CRM_API_KEY not set)'}")
+        job_print(f"Data file: {OUTPUT_EXCEL}")
         job_print("=" * 60)
 
         create_empty_excel()
@@ -1443,16 +1487,25 @@ def run_scrape_job():
             job_print(f"⏩ {len(done_queries)} queries already done (resume).")
         sync_to_crm()
 
+        job_print("🌐 Starting browser...")
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=HEADLESS,
-                                        args=["--disable-blink-features=AutomationControlled"])
+            browser = p.chromium.launch(
+                headless=HEADLESS,
+                args=["--disable-blink-features=AutomationControlled",
+                      "--no-sandbox",
+                      "--disable-setuid-sandbox",
+                      "--disable-dev-shm-usage",
+                      "--disable-gpu"],
+            )
             context = browser.new_context(
                 viewport={"width": 1280, "height": 900},
+                locale="en-US",
                 user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                             "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
             )
             page = context.new_page()
             page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+            job_print("✅ Browser ready, starting searches...")
 
             pending_done = []
             try:
@@ -1473,14 +1526,15 @@ def run_scrape_job():
                         leads, completed = scrape(page, query, city, seen_ids, seen_keys, industry)
 
                         fb_ran = False
-                        if LEAD_FILTER == "no_website" and (WEB_FALLBACK == "always" or (WEB_FALLBACK == "no_leads" and not leads)):
+                        if LEAD_FILTER == "no_website" and not _job.get("stop") and \
+                           (WEB_FALLBACK == "always" or (WEB_FALLBACK == "no_leads" and not leads)):
                             fb_ran = True
                             fb_leads = web_fallback(page, service, city, seen_ids, seen_keys, industry)
                             if fb_leads:
                                 save_leads(fb_leads)
                                 leads = leads + fb_leads
 
-                        if completed or fb_ran:
+                        if (completed or fb_ran) and not _job.get("stop"):
                             done_queries.add(done_key)
                             pending_done.append(done_key)
                         with _job_lock:
@@ -1522,7 +1576,7 @@ input[type=text]{width:100%;padding:.5rem;border:1px solid #ddd;border-radius:6p
 button,.btn{background:#1e40af;color:#fff;border:none;border-radius:8px;padding:.65rem 1.1rem;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block}
 button.sec,.btn.sec{background:#e2e8f0;color:#111}
 button:disabled{opacity:.5}
-#log{background:#0f172a;color:#e2e8f0;font:12px/1.4 ui-monospace,monospace;padding:1rem;border-radius:8px;max-height:340px;overflow:auto;white-space:pre-wrap}
+#log{background:#0f172a;color:#e2e8f0;font:12px/1.4 ui-monospace,monospace;padding:1rem;border-radius:8px;max-height:420px;overflow:auto;white-space:pre-wrap}
 .flash{padding:.6rem 1rem;border-radius:8px;margin-bottom:.8rem;background:#ecfdf5;color:#047857}
 .flash.err{background:#fef2f2;color:#b91c1c}
 </style></head><body>
@@ -1562,21 +1616,29 @@ button:disabled{opacity:.5}
 </div>
 {% else %}
 <div class="card">
-  <p><b>{{ 'RUNNING' if running else 'IDLE' }}</b> — {{ summary }}</p>
-  <p>Saved: {{ stats.saved }} | Queries: {{ stats.queries_done }}/{{ stats.queries_total }}</p>
+  <p><b id="st">{{ 'RUNNING' if running else 'IDLE' }}</b> — {{ summary }}</p>
+  <p>Saved: <span id="sv">{{ stats.saved }}</span> | Queries: <span id="qd">{{ stats.queries_done }}</span>/<span id="qt">{{ stats.queries_total }}</span></p>
   <p>
     {% if running %}<form method="post" action="{{ url_for('stop') }}" style="display:inline"><button class="sec" type="submit">Stop</button></form>{% endif %}
     <a class="btn sec" href="{{ url_for('index') }}">Setup</a>
     {% if excel %}<a class="btn" href="{{ url_for('download') }}">Download Excel</a>{% endif %}
+    {% if debug_shot %}<a class="btn sec" href="{{ url_for('debug_png') }}" target="_blank">Debug screenshot</a>{% endif %}
   </p>
   <div id="log">{{ log }}</div>
 </div>
 <script>
 function poll(){fetch("{{ url_for('api_status') }}").then(r=>r.json()).then(d=>{
-  document.getElementById("log").textContent=d.log.join("\\n");
-  if(d.running) setTimeout(poll,2500);
-}).catch(()=>setTimeout(poll,4000));}
-{% if running %}poll();{% endif %}
+  var el=document.getElementById("log");
+  var atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-40;
+  el.textContent=d.log.join("\\n");
+  if(atEnd) el.scrollTop=el.scrollHeight;
+  document.getElementById("st").textContent=d.running?"RUNNING":"IDLE";
+  document.getElementById("sv").textContent=d.stats.saved;
+  document.getElementById("qd").textContent=d.stats.queries_done;
+  document.getElementById("qt").textContent=d.stats.queries_total;
+  setTimeout(poll,3000);
+}).catch(()=>setTimeout(poll,5000));}
+poll();
 </script>
 {% endif %}
 </body></html>
@@ -1629,6 +1691,7 @@ def status():
             stats=_job["stats"],
             log="\n".join(_job["log"]) or "(waiting…)",
             excel=os.path.exists(OUTPUT_EXCEL),
+            debug_shot=os.path.exists(DEBUG_SHOT),
         )
 
 
@@ -1643,7 +1706,15 @@ def download():
     if not os.path.exists(OUTPUT_EXCEL):
         flash("No Excel yet.", "error")
         return redirect(url_for("index"))
-    return send_file(OUTPUT_EXCEL, as_attachment=True, download_name=OUTPUT_EXCEL)
+    return send_file(OUTPUT_EXCEL, as_attachment=True, download_name=os.path.basename(OUTPUT_EXCEL))
+
+
+@app.route("/debug.png")
+def debug_png():
+    if not os.path.exists(DEBUG_SHOT):
+        flash("No debug screenshot yet.", "error")
+        return redirect(url_for("status"))
+    return send_file(DEBUG_SHOT, mimetype="image/png")
 
 
 if __name__ == "__main__":
@@ -1652,4 +1723,4 @@ if __name__ == "__main__":
     else:
         port = int(os.environ.get("PORT", 5000))
         print(f"Open http://0.0.0.0:{port}")
-        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+        app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
