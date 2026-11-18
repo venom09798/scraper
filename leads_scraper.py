@@ -512,6 +512,8 @@ SAVE_EVERY = 5
 NAV_TIMEOUT = 30000          # ms for each page.goto attempt
 RECYCLE_EVERY = 10           # open a fresh browser tab after this many searches (prevents crashes)
 NAV_RETRIES = 1              # extra attempts after the first one
+BLOCK_MAP_TILES = True        # do not draw the map itself (lighter + far fewer browser crashes)
+MAP_TILE_PARTS = ("/maps/vt", "/vt/pb", "khms", "/kh?v=", "StaticMapService", "/maps/vt/stream")
 BLOCK_HEAVY_RESOURCES = True # do not load images / media / fonts (much faster pages)
 
 
@@ -919,6 +921,30 @@ def _crm_outcome(r):
     return "error"
 
 
+def _post_lead(row, headers):
+    """Send one lead. If the CRM answers with a server error (500) or rejects the data, retry with
+    fewer fields (no email / social links, then only the basics). Returns (reply, what_was_removed)."""
+    full = _crm_payload(row)
+    lite = dict(full)
+    for k in ("email", "instagram", "facebook", "linkedin", "twitter", "youtube"):
+        lite[k] = ""
+    lite["notes"] = (lite.get("notes") or "")[:200]
+    basic = {k: "" for k in full}
+    basic.update({
+        "location": full.get("location", ""),
+        "lead_type": full.get("lead_type", ""),
+        "company_name": re.sub(r"[^\x20-\x7E]", "", full.get("company_name", "")).strip() or full.get("company_name", ""),
+        "phone_number": re.sub(r"[^\d+]", "", full.get("phone_number", "")),
+        "status": full.get("status", "new"),
+    })
+    r = None
+    for label, payload in (("", full), ("email, social links", lite), ("everything except name/phone", basic)):
+        r = requests.post(API_URL, json=payload, headers=headers, timeout=15)
+        if r.status_code < 500 and r.status_code not in (400, 422):
+            return r, label
+    return r, "failed"
+
+
 def sync_to_crm():
     """Send leads that are not yet in the CRM. Failed leads are retried next time,
     sent leads are never sent twice. Every reply is printed / logged so problems are visible."""
@@ -934,7 +960,7 @@ def sync_to_crm():
 
     smap = {k: [p, s] for k, p, s in zip(state_df["key"], state_df["place_id"], state_df["crm_synced"])}
     keys = [make_key(n, p, a) for n, p, a in zip(leads_df["name"], leads_df["phone"], leads_df["address"])]
-    pending = [(i, k) for i, k in zip(leads_df.index, keys) if smap.get(k, ["", "No"])[1] != "Yes"]
+    pending = [(i, k) for i, k in zip(leads_df.index, keys) if smap.get(k, ["", "No"])[1] not in ("Yes", "Error")]
     if not pending:
         return
 
@@ -943,12 +969,15 @@ def sync_to_crm():
     def mark(k):
         smap.setdefault(k, ["", "No"])[1] = "Yes"
 
+    def mark_err(k):
+        smap.setdefault(k, ["", "No"])[1] = "Error"
+
     def state_now():
         return pd.DataFrame([{"key": k, "place_id": v[0], "crm_synced": v[1]}
                              for k, v in smap.items()], columns=STATE_COLS)
 
     headers = _crm_headers()
-    created = duplicates = failed = 0
+    created = duplicates = failed = errored = 0
     try:
         if PAYLOAD_MODE == "bulk":
             body = {"leads": [_crm_payload(leads_df.loc[i].to_dict()) for i, _ in pending]}
@@ -965,17 +994,13 @@ def sync_to_crm():
                 if _job.get("stop"):
                     break
                 row = leads_df.loc[i].to_dict()
-                r = requests.post(API_URL, json=_crm_payload(row), headers=headers, timeout=15)
-                if r.status_code == 422 and "email" in r.text.lower() and row.get("email"):
-                    retry = _crm_payload(row)
-                    retry["email"] = ""
-                    r = requests.post(API_URL, json=retry, headers=headers, timeout=15)
-                    if r.status_code in OK_CODES:
-                        print(f"   ✉️  {row['name'][:35]}: CRM rejected the email, lead sent without it")
+                r, used = _post_lead(row, headers)
                 outcome = _crm_outcome(r)
                 if outcome == "ok":
                     mark(k)
                     created += 1
+                    if used:
+                        print(f"   ✉️  {row['name'][:35]}: CRM had trouble with some fields, lead sent without: {used}")
                 elif outcome == "duplicate":
                     mark(k)
                     duplicates += 1
@@ -986,7 +1011,9 @@ def sync_to_crm():
                     break
                 else:
                     failed += 1
-                    print(f"❌ {row['name'][:35]}: CRM error {r.status_code} {clean(r.text)[:150]}")
+                    errored += 1
+                    mark_err(k)      # never retried again, so the log does not repeat this error
+                    print(f"❌ {row['name'][:35]}: CRM refuses this lead ({r.status_code}), kept in Excel only")
                 if (created + duplicates) and (created + duplicates) % 25 == 0:
                     write_data(leads_df, state_now())
                 time.sleep(0.2)
@@ -996,13 +1023,13 @@ def sync_to_crm():
     except Exception as e:
         print(f"❌ CRM sync error: {str(e)[:150]}")
     finally:
-        if created or duplicates:
+        if created or duplicates or errored:
             write_data(leads_df, state_now())
         total_in_crm = sum(1 for k in keys if smap.get(k, ["", "No"])[1] == "Yes")
         if created or duplicates:
             extra = f" | {duplicates} already existed" if duplicates else ""
             print(f"📡 CRM saved | +{created} new | Total: {total_in_crm}{extra}")
-        left = len(pending) - created - duplicates
+        left = len(pending) - created - duplicates - errored
         if left and not _job.get("stop"):
             print(f"⚠️ {left} leads not sent to the CRM yet (they are saved in Excel and will be retried)")
 
@@ -1503,8 +1530,14 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
     try:
         url = f"https://www.google.com/maps/search/{quote(query)}"
         safe_goto(page, url, timeout=60000)
-        nap(3)
         _accept_consent(page)
+        # wait until the result list (or a single place page) is really there
+        try:
+            page.wait_for_selector('div[role="feed"], a[href*="/maps/place/"], h1', timeout=20000)
+        except Exception:
+            check_stop()
+            _accept_consent(page)
+        nap(1.5)
 
         try:
             feed = page.locator('div[role="feed"]')
@@ -1726,13 +1759,7 @@ def run_scrape_job():
                                 "--disable-dev-shm-usage",
                                 "--disable-gpu",
                                 "--disable-extensions",
-                                "--disable-software-rasterizer",
-                                "--disable-background-networking",
-                                "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter",
-                                "--disable-component-update",
-                                "--disable-sync",
                                 "--no-first-run",
-                                "--renderer-process-limit=1",
                                 "--mute-audio"]
                 bholder = {"b": None}
 
@@ -1757,18 +1784,24 @@ def run_scrape_job():
                             route.abort()
                         elif BLOCK_HEAVY_RESOURCES and route.request.resource_type in ("image", "media", "font"):
                             route.abort()
+                        elif BLOCK_MAP_TILES and any(x in route.request.url for x in MAP_TILE_PARTS):
+                            route.abort()       # map drawing is what makes Chromium crash; the contact data is not in the tiles
                         else:
                             route.continue_()
                     except Exception:
                         pass
 
-                holder = {"ctx": None}
+                holder = {"ctx": None, "state": None}
 
                 def fresh_page(restart=False):
                     """New browser context + tab. Used at start, after a crash, and every
                     RECYCLE_EVERY searches to free memory. restart=True also relaunches Chromium."""
                     global PAGE_CRASHED
                     if holder["ctx"] is not None:
+                        try:
+                            holder["state"] = holder["ctx"].storage_state()   # keeps Google consent cookies
+                        except BaseException:
+                            pass
                         try:
                             holder["ctx"].close()
                         except BaseException:
@@ -1778,6 +1811,7 @@ def run_scrape_job():
                         launch_browser()
                         nap(2)
                     ctx = bholder["b"].new_context(
+                        storage_state=holder.get("state"),
                         viewport={"width": 1024, "height": 720},
                         locale="en-US",
                         user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
