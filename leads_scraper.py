@@ -510,6 +510,7 @@ SAVE_EVERY = 5
 
 # Page loading: shorter timeouts so a slow page never blocks the run for long
 NAV_TIMEOUT = 30000          # ms for each page.goto attempt
+RECYCLE_EVERY = 10           # open a fresh browser tab after this many searches (prevents crashes)
 NAV_RETRIES = 1              # extra attempts after the first one
 BLOCK_HEAVY_RESOURCES = True # do not load images / media / fonts (much faster pages)
 
@@ -607,6 +608,39 @@ def short_err(e):
     if "closed" in msg.lower():
         return "browser closed"
     return msg[:110]
+
+
+PAGE_CRASHED = False
+
+
+def mem_info():
+    """Memory limit / usage of this container in MB (Railway = cgroup files). '' if unknown."""
+    def rd(*paths):
+        for pth in paths:
+            try:
+                v = open(pth).read().strip()
+                if v.isdigit() and int(v) < 1 << 50:
+                    return int(v) / 1048576
+            except Exception:
+                pass
+        return None
+    lim = rd("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    use = rd("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes")
+    if lim is None and use is None:
+        return ""
+    return f"RAM used {use:.0f} MB / limit {lim:.0f} MB" if lim and use else \
+        (f"RAM used {use:.0f} MB" if use else f"RAM limit {lim:.0f} MB")
+
+
+def note_crash(e):
+    """True (and remembers it) when Chromium reported 'Page crashed' / 'Target closed'.
+    The run loop then opens a fresh browser tab, because a crashed tab never recovers."""
+    global PAGE_CRASHED
+    m = str(e).lower()
+    if "crash" in m or "target closed" in m or "has been closed" in m:
+        PAGE_CRASHED = True
+        return True
+    return False
 
 
 def safe_goto(page, url, timeout=None, retries=None, wait_until="domcontentloaded"):
@@ -1450,6 +1484,10 @@ def web_fallback(page, service, city, seen_ids, seen_keys, industry="", out=None
             seen_keys.add(key)
             print(f"   🔎 📞 NO-WEBSITE ({plat}) {name[:40]} | {phone or '-'} | {email or '-'}")
         except Exception as e:
+            check_stop()
+            if note_crash(e):
+                print("   🔎 ⚠️ browser tab crashed, opening a fresh one...")
+                break
             print(f"   🔎 ⚠️ {short_err(e)} (skipped)")
             continue
     return leads
@@ -1617,15 +1655,22 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
 
             except Exception as e:
                 check_stop()
+                if note_crash(e):
+                    print(f"   [{i+1}] ⚠️ browser tab crashed, opening a fresh one and moving on...")
+                    break
                 print(f"   [{i+1}] ⚠️ {short_err(e)} (skipped)")
                 continue
 
-        completed = bool(places)
+        completed = bool(places) and not PAGE_CRASHED
 
     except StopJob:
         stopped = True
     except Exception as e:
-        print(f"❌ Failed: {short_err(e)}")
+        check_stop()
+        if note_crash(e):
+            print("   ⚠️ browser tab crashed, opening a fresh one...")
+        else:
+            print(f"❌ Failed: {short_err(e)}")
 
     # always save what was found so far (also when Stop was pressed)
     if saved_upto < len(leads):
@@ -1675,22 +1720,36 @@ def run_scrape_job():
         pending_done = []
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=HEADLESS,
-                    args=["--disable-blink-features=AutomationControlled",
-                          "--no-sandbox",
-                          "--disable-setuid-sandbox",
-                          "--disable-dev-shm-usage",
-                          "--disable-gpu"],
-                )
-                context = browser.new_context(
-                    viewport={"width": 1280, "height": 900},
-                    locale="en-US",
-                    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
-                )
-                context.set_default_navigation_timeout(60000)
-                context.set_default_timeout(30000)
+                BROWSER_ARGS = ["--disable-blink-features=AutomationControlled",
+                                "--no-sandbox",
+                                "--disable-setuid-sandbox",
+                                "--disable-dev-shm-usage",
+                                "--disable-gpu",
+                                "--disable-extensions",
+                                "--disable-software-rasterizer",
+                                "--disable-background-networking",
+                                "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter",
+                                "--disable-component-update",
+                                "--disable-sync",
+                                "--no-first-run",
+                                "--renderer-process-limit=1",
+                                "--mute-audio"]
+                bholder = {"b": None}
+
+                def launch_browser():
+                    """(Re)start Chromium completely. Frees all memory used by the old one."""
+                    if bholder["b"] is not None:
+                        try:
+                            bholder["b"].close()
+                        except BaseException:
+                            pass
+                    bholder["b"] = p.chromium.launch(headless=HEADLESS, args=BROWSER_ARGS)
+                    return bholder["b"]
+
+                browser = launch_browser()
+                mi = mem_info()
+                if mi:
+                    job_print(f"🧠 {mi}")
 
                 def _route(route):
                     try:
@@ -1702,9 +1761,39 @@ def run_scrape_job():
                             route.continue_()
                     except Exception:
                         pass
-                context.route("**/*", _route)
-                page = context.new_page()
-                page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+                holder = {"ctx": None}
+
+                def fresh_page(restart=False):
+                    """New browser context + tab. Used at start, after a crash, and every
+                    RECYCLE_EVERY searches to free memory. restart=True also relaunches Chromium."""
+                    global PAGE_CRASHED
+                    if holder["ctx"] is not None:
+                        try:
+                            holder["ctx"].close()
+                        except BaseException:
+                            pass
+                        holder["ctx"] = None
+                    if restart:
+                        launch_browser()
+                        nap(2)
+                    ctx = bholder["b"].new_context(
+                        viewport={"width": 1024, "height": 720},
+                        locale="en-US",
+                        user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+                    )
+                    ctx.set_default_navigation_timeout(60000)
+                    ctx.set_default_timeout(30000)
+                    ctx.route("**/*", _route)
+                    pg = ctx.new_page()
+                    pg.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                    holder["ctx"] = ctx
+                    PAGE_CRASHED = False
+                    return pg
+
+                page = fresh_page()
+                searches_since_fresh = 0
                 job_print("✅ Browser ready, starting searches...")
 
                 try:
@@ -1719,10 +1808,28 @@ def run_scrape_job():
                                     _job["stats"]["queries_done"] += 1
                                 continue
 
-                            leads, completed = scrape(page, query, city, seen_ids, seen_keys, industry)
+                            if PAGE_CRASHED or searches_since_fresh >= RECYCLE_EVERY:
+                                if PAGE_CRASHED:
+                                    job_print("🔄 Browser tab crashed, restarting Chromium...")
+                                page = fresh_page(restart=PAGE_CRASHED)
+                                searches_since_fresh = 0
+                            searches_since_fresh += 1
+
+                            crash_tries = 0
+                            while True:
+                                leads, completed = scrape(page, query, city, seen_ids, seen_keys, industry)
+                                if PAGE_CRASHED and crash_tries < 2:
+                                    crash_tries += 1
+                                    mi = mem_info()
+                                    job_print(f"🔄 Browser crashed{(' (' + mi + ')') if mi else ''}. "
+                                              f"Restarting Chromium and retrying this search ({crash_tries}/2)...")
+                                    page = fresh_page(restart=True)
+                                    searches_since_fresh = 0
+                                    continue
+                                break
 
                             fb_ran = False
-                            if LEAD_FILTER == "no_website" and \
+                            if LEAD_FILTER == "no_website" and not PAGE_CRASHED and \
                                (WEB_FALLBACK == "always" or (WEB_FALLBACK == "no_leads" and not leads)):
                                 fb_ran = True
                                 fb_leads = []
@@ -1733,7 +1840,7 @@ def run_scrape_job():
                                     if fb_leads:
                                         save_leads(fb_leads)
 
-                            if completed or fb_ran:
+                            if (completed or fb_ran) and not PAGE_CRASHED:
                                 done_queries.add(done_key)
                                 pending_done.append(done_key)
                             with _job_lock:
@@ -1744,7 +1851,8 @@ def run_scrape_job():
                         pending_done = []
                 finally:
                     try:
-                        browser.close()
+                        if bholder["b"] is not None:
+                            bholder["b"].close()
                     except BaseException:
                         pass
         finally:
