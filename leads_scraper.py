@@ -19,7 +19,7 @@ Environment variables (Railway -> Variables, or set in your terminal when runnin
 Run locally (Windows PowerShell):
   pip install flask pandas openpyxl requests playwright psutil
   playwright install chromium
-  $env:CRM_API_KEY="your-key-here"
+  $env:CRM_API_KEY="f33f43afb069e63f3ab24b0ee3d121275736ccae9531ef54"
   python leads_scraper.py
   -> http://127.0.0.1:5000
 
@@ -528,7 +528,7 @@ FALLBACK_SITES = ["facebook.com", "instagram.com", "threads.net", "linkedin.com/
 
 API_ENABLED = True
 API_URL = os.getenv("CRM_API_URL", "https://crm.rhoflow.net/api/external/leads")
-API_KEY = os.getenv("CRM_API_KEY", "").strip()
+API_KEY = os.getenv("CRM_API_KEY", "f33f43afb069e63f3ab24b0ee3d121275736ccae9531ef54").strip()
 API_KEY_HEADER = "X-API-Key"
 PAYLOAD_MODE = "single"
 
