@@ -19,7 +19,7 @@ Environment variables (Railway -> Variables, or set in your terminal when runnin
 Run locally (Windows PowerShell):
   pip install flask pandas openpyxl requests playwright psutil
   playwright install chromium
-  $env:CRM_API_KEY="f33f43afb069e63f3ab24b0ee3d121275736ccae9531ef54"
+  $env:CRM_API_KEY="your-key-here"
   python leads_scraper.py
   -> http://127.0.0.1:5000
 
@@ -1999,7 +1999,7 @@ a{color:inherit}
 
 /* ---- top bar ---- */
 .hero{background:linear-gradient(135deg,var(--brand-dark),var(--brand) 55%,var(--brand-2));color:#fff;
-  padding:26px 0 70px;margin-bottom:-48px}
+  padding:22px 0;margin-bottom:22px}
 .hero .wrap{padding-bottom:0}
 .hero-row{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
 .brand{display:flex;align-items:center;gap:12px}
@@ -2104,7 +2104,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
 /* ---- mobile ---- */
 @media (max-width:640px){
   .wrap{padding:0 14px 40px}
-  .hero{padding:18px 0 62px}
+  .hero{padding:16px 0;margin-bottom:16px}
   .hero-row{flex-direction:column;align-items:stretch;gap:14px}
   .hero h1{font-size:1.25rem}
   nav.tabs{width:100%}
