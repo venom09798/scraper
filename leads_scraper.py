@@ -2,30 +2,40 @@
 Leads Scraper — Flask version (Railway / Docker ready)
 Setup form in browser, scrape runs in background. Single file (design is built in).
 
-Sources : Google Maps + Google / DuckDuckGo fallback
+Sources : Google Maps  +  web search fallback (Google / Bing / DuckDuckGo) that looks for
+          Facebook, Instagram, Threads, LinkedIn and X pages of businesses WITHOUT a website.
 Output  : UK_Leads.xlsx + optional CRM
 
 Environment variables (Railway -> Variables, or set in your terminal when running locally):
+  LOGIN_USER    login username   (default is set in the script)
+  LOGIN_EMAIL   login email      (default is set in the script, username or email both work)
+  LOGIN_PASS    login password   (optional: overrides the built-in password, set it on Railway)
+  SECRET_KEY    long random text used to sign the login cookie (recommended on Railway)
   CRM_API_KEY   your CRM API key (required for CRM sync)
   CRM_API_URL   optional, overrides the CRM endpoint
   DATA_DIR      optional, folder for the Excel file (set to /data when a Volume is mounted there)
   PORT          set by Railway automatically
 
 Run locally (Windows PowerShell):
-  pip install flask pandas openpyxl requests playwright
+  pip install flask pandas openpyxl requests playwright psutil
   playwright install chromium
   $env:CRM_API_KEY="f33f43afb069e63f3ab24b0ee3d121275736ccae9531ef54"
   python leads_scraper.py
   -> http://127.0.0.1:5000
+
+(psutil is optional but recommended: it lets the Stop button close the browser instantly.)
 """
 from playwright.sync_api import sync_playwright
 from openpyxl.worksheet.datavalidation import DataValidation
-from flask import Flask, request, redirect, url_for, flash, send_file, render_template_string, jsonify
+from flask import Flask, request, redirect, url_for, flash, send_file, render_template_string, jsonify, session
 from threading import Thread, Lock
+import hmac
+import secrets
 from datetime import datetime
 from urllib.parse import quote, urlparse, parse_qs, unquote
 import pandas as pd
 import requests
+import base64
 import shutil
 import time
 import re
@@ -62,6 +72,47 @@ def print(*args, **kwargs):  # noqa: A001  (intentionally shadows the builtin)
 
 def job_print(msg):
     print(msg)
+
+
+# ── instant stop ────────────────────────────────────────────────────────────
+class StopJob(BaseException):
+    """Raised when the Stop button was pressed. BaseException on purpose, so the many
+    'except Exception' blocks in the scraper can never swallow it."""
+
+
+def check_stop():
+    if _job.get("stop"):
+        raise StopJob()
+
+
+def nap(seconds):
+    """Sleep, but wake up immediately when Stop is pressed."""
+    end = time.time() + seconds
+    while True:
+        check_stop()
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(0.2, left))
+
+
+def kill_browser():
+    """Close the Chromium processes right away so any page load in progress fails at once.
+    Needs psutil (optional). Without it, the scraper still stops at the next step."""
+    try:
+        import psutil
+    except ImportError:
+        return
+    try:
+        for child in psutil.Process().children(recursive=True):
+            try:
+                name = child.name().lower()
+                if "chrom" in name or "headless" in name:
+                    child.kill()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 SERVICES = [
@@ -424,7 +475,7 @@ OFFER_SERVICES = list(SERVICE_OPTIONS.values())
 
 
 def configure_from_form(lead_choice, region_picks, industry_picks, custom_terms, offer_picks):
-    """Apply web-form choices (same effect as original configure_run)."""
+    """Apply web-form choices."""
     global LEAD_FILTER, SEARCH_TERMS, OFFER_SERVICES, ACTIVE_REGIONS, LOCATIONS
     LEAD_FILTER = "no_website" if lead_choice == "1" else "with_website"
 
@@ -443,12 +494,6 @@ def configure_from_form(lead_choice, region_picks, industry_picks, custom_terms,
 
     OFFER_SERVICES = [SERVICE_OPTIONS[k] for k in offer_picks if k in SERVICE_OPTIONS] or list(SERVICE_OPTIONS.values())
 
-    print("\n✅ Setup done")
-    print(f"   Lead type : {LEAD_TYPE_OPTIONS.get(lead_choice, lead_choice)}")
-    print(f"   Regions   : {', '.join(ACTIVE_REGIONS)} ({len(LOCATIONS)} locations)")
-    print(f"   Industries: {', '.join(dict.fromkeys(lbl for _, lbl in SEARCH_TERMS))}")
-    print(f"   Services  : {', '.join(OFFER_SERVICES)}")
-
 
 def notes_text(industry):
     return f"Industry: {industry} | Offer: {', '.join(OFFER_SERVICES)}"
@@ -460,12 +505,12 @@ HEADLESS = True
 OUTPUT_EXCEL = os.path.join(DATA_DIR, "UK_Leads.xlsx")
 SEED_EXCEL = "UK_Leads.xlsx"        # copy shipped in the repo, used once to seed an empty /data volume
 DEBUG_SHOT = os.path.join(DATA_DIR, "debug.png")
-DELAY = 5
+DELAY = 3
 SAVE_EVERY = 5
 
-# Page loading: longer timeout + retries so one slow Google Maps page does not skip the place
-NAV_TIMEOUT = 45000          # ms for each page.goto attempt
-NAV_RETRIES = 2              # extra attempts after the first one
+# Page loading: shorter timeouts so a slow page never blocks the run for long
+NAV_TIMEOUT = 30000          # ms for each page.goto attempt
+NAV_RETRIES = 1              # extra attempts after the first one
 BLOCK_HEAVY_RESOURCES = True # do not load images / media / fonts (much faster pages)
 
 
@@ -473,13 +518,17 @@ ONLY_WITH_CONTACT = True
 
 USE_SEARCH_FALLBACK = True
 
+# Web search for businesses WITHOUT a website (Facebook, Instagram, Threads, LinkedIn, X).
+# "always"  -> run after every Maps query      "no_leads" -> only when Maps found nothing
 WEB_FALLBACK = "always"
-SEARCH_ENGINES = ["google", "duckduckgo"]
+SEARCH_ENGINES = ["google", "bing", "duckduckgo"]
 FALLBACK_MAX_RESULTS = 15
+# Sites searched with  "<service> <city> site:<site>"  (remove one to make the run faster)
+FALLBACK_SITES = ["facebook.com", "instagram.com", "threads.net", "linkedin.com/company", "linkedin.com/in", "x.com"]
 
 API_ENABLED = True
 API_URL = os.getenv("CRM_API_URL", "https://crm.rhoflow.net/api/external/leads")
-API_KEY = os.getenv("CRM_API_KEY", "f33f43afb069e63f3ab24b0ee3d121275736ccae9531ef54").strip()
+API_KEY = os.getenv("CRM_API_KEY", "").strip()
 API_KEY_HEADER = "X-API-Key"
 PAYLOAD_MODE = "single"
 
@@ -535,10 +584,10 @@ PHONE_RE = (r"(?:\+\d{1,3}[\s.-]?\(?\d{1,4}\)?(?:[\s.-]?\d{2,5}){2,4}"
             r"|\(?\b[2-9]\d{2}\)?[\s.-]\d{3}[\s.-]\d{4})")
 
 SOCIAL_HOSTS = ("facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com",
-                "youtube.com", "tiktok.com", "pinterest.com")
+                "youtube.com", "tiktok.com", "pinterest.com", "threads.net", "threads.com")
 IGNORE_HOSTS = SOCIAL_HOSTS + ("google.", "goo.gl", "bit.ly", "wa.me", "whatsapp.com", "linktr.ee",
-                               "fb.me", "fb.com", "duckduckgo", "w3.org", "schema.org",
-                               "gstatic", "fbcdn", "fbsbx", "cloudfront")
+                               "fb.me", "fb.com", "duckduckgo", "bing.com", "microsoft.com",
+                               "w3.org", "schema.org", "gstatic", "fbcdn", "fbsbx", "cloudfront")
 
 
 def clean(text):
@@ -548,22 +597,33 @@ def clean(text):
 
 
 def short_err(e):
-    """First line of a Playwright error, without the long 'Call log' part."""
-    return clean(str(e).split("Call log")[0])[:110]
+    """Short, readable version of a Playwright error (no 'Call log', no long URLs)."""
+    msg = clean(str(e).split("Call log")[0])
+    if "Timeout" in msg:
+        return "page timed out"
+    m = re.search(r"net::\w+", msg)
+    if m:
+        return f"network error ({m.group(0)})"
+    if "closed" in msg.lower():
+        return "browser closed"
+    return msg[:110]
 
 
 def safe_goto(page, url, timeout=None, retries=None, wait_until="domcontentloaded"):
-    """page.goto with a longer timeout and retries. Raises only after all attempts fail."""
+    """page.goto with a timeout and retries. Raises only after all attempts fail.
+    Stops immediately when the Stop button was pressed."""
     timeout = timeout or NAV_TIMEOUT
     retries = NAV_RETRIES if retries is None else retries
     for attempt in range(retries + 1):
+        check_stop()
         try:
             page.goto(url, timeout=timeout, wait_until=wait_until)
             return
         except Exception:
+            check_stop()
             if attempt >= retries:
                 raise
-            time.sleep(2 + attempt * 2)
+            nap(1 + attempt)
 
 
 STRICT_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,24}$")
@@ -628,7 +688,7 @@ def _read_sheet(sheet):
             return pd.read_excel(OUTPUT_EXCEL, sheet_name=sheet, dtype=str).fillna("")
         except PermissionError:
             print(f"⚠️ {OUTPUT_EXCEL} is open in Excel. Close it, retrying in 10 seconds...")
-            time.sleep(10)
+            nap(10)
         except ValueError:
             return None
         except Exception as e:
@@ -828,7 +888,7 @@ def _crm_outcome(r):
 def sync_to_crm():
     """Send leads that are not yet in the CRM. Failed leads are retried next time,
     sent leads are never sent twice. Every reply is printed / logged so problems are visible."""
-    if not API_ENABLED:
+    if not API_ENABLED or _job.get("stop"):
         return
     if not API_KEY or "PASTE_" in API_URL:
         print("⚠️ CRM_API_KEY / CRM URL is not set, CRM sync skipped (data is saved in Excel).")
@@ -909,7 +969,7 @@ def sync_to_crm():
             extra = f" | {duplicates} already existed" if duplicates else ""
             print(f"📡 CRM saved | +{created} new | Total: {total_in_crm}{extra}")
         left = len(pending) - created - duplicates
-        if left:
+        if left and not _job.get("stop"):
             print(f"⚠️ {left} leads not sent to the CRM yet (they are saved in Excel and will be retried)")
 
 
@@ -1002,9 +1062,10 @@ def get_socials(page, website):
     if not website or not website.startswith("http"):
         return data
     try:
-        safe_goto(page, website, timeout=20000, retries=1)
-        time.sleep(2)
+        safe_goto(page, website, timeout=15000, retries=0)
+        nap(1.5)
         for a in page.locator("a[href]").all():
+            check_stop()
             try:
                 href = (a.get_attribute("href") or "")
                 if href.lower().startswith("mailto:"):
@@ -1047,15 +1108,17 @@ def search_fallback(page, name, address, need_phone, need_email):
     contain the business name are used (avoids wrong numbers). Then try its Facebook page."""
     data = empty_socials()
     try:
+        check_stop()
         parts = [p.strip() for p in (address or "").split(",") if p.strip()]
         place = " ".join(parts[-2:]) if parts else ""
         q = f"{name} {place} contact email phone"
         page.goto("https://html.duckduckgo.com/html/?q=" + quote(q),
                   timeout=15000, wait_until="domcontentloaded")
-        time.sleep(2)
+        nap(1.5)
 
         name_key = name.lower()[:15]
         for block in page.locator("div.result").all()[:8]:
+            check_stop()
             try:
                 text = block.inner_text(timeout=2000)
                 if name_key not in text.lower():
@@ -1078,8 +1141,9 @@ def search_fallback(page, name, address, need_phone, need_email):
 
         if data["facebook"] and ((need_email and not data["email"]) or (need_phone and not data["phone"])):
             try:
+                check_stop()
                 page.goto(data["facebook"], timeout=12000, wait_until="domcontentloaded")
-                time.sleep(2)
+                nap(1.5)
                 content = page.content()
                 if need_email and not data["email"]:
                     fb_em = good_emails(content)
@@ -1098,28 +1162,53 @@ def search_fallback(page, name, address, need_phone, need_email):
 
 FB_SKIP = ("/posts/", "/photos/", "/videos/", "/groups/", "/events/", "/watch", "/reel",
            "/story", "/share", "/hashtag", "/marketplace", "/login", "/sharer", "/permalink", "/public/")
+LI_SKIP = ("/jobs", "/posts", "/pulse", "/feed", "/learning", "/school", "/showcase", "/events",
+           "/groups", "/directory", "/salary", "/login", "/signup", "/legal", "/help")
+X_SKIP = ("home", "search", "explore", "i", "intent", "share", "hashtag", "login", "signup", "settings", "tos", "privacy")
 URL_RE = r"(?:https?://|www\.)[a-z0-9][a-z0-9.-]*\.[a-z]{2,}(?:/[^\s]*)?"
 GOOGLE_BLOCKED = False
 
 
+def _host_is(host, domain):
+    return host == domain or host.endswith("." + domain)
+
+
 def normalize_social(url):
-    """Turn a Facebook / Instagram result into the page root URL. Posts/photos/groups -> None."""
+    """Turn a Facebook / Instagram / Threads / LinkedIn / X result into the profile root URL.
+    Posts, photos, groups, job pages ... -> None.  Returns (platform, root_url)."""
     try:
         u = urlparse(url or "")
-        host = re.sub(r"^(www|m|mobile|web)\.", "", u.netloc.lower())
+        host = u.netloc.lower()
         path = u.path.strip("/")
-        if host == "facebook.com":
+        parts = path.split("/") if path else []
+
+        if _host_is(host, "facebook.com"):
             if not path or any(x in "/" + path + "/" for x in FB_SKIP):
                 return None
-            parts = path.split("/")
             if parts[0] in ("pages", "people") and len(parts) >= 3:
                 return "facebook", f"https://www.facebook.com/{parts[0]}/{parts[1]}/{parts[2]}"
             return "facebook", f"https://www.facebook.com/{parts[0]}"
-        if host == "instagram.com":
-            parts = path.split("/")
-            if not parts[0] or parts[0] in ("p", "reel", "reels", "explore", "tv", "stories", "accounts"):
+
+        if _host_is(host, "instagram.com"):
+            if not parts or parts[0] in ("p", "reel", "reels", "explore", "tv", "stories", "accounts"):
                 return None
             return "instagram", f"https://www.instagram.com/{parts[0]}/"
+
+        if _host_is(host, "threads.net") or _host_is(host, "threads.com"):
+            if not parts or not parts[0].startswith("@") or "post" in parts:
+                return None
+            return "threads", f"https://www.threads.net/{parts[0]}"
+
+        if _host_is(host, "linkedin.com"):
+            if len(parts) >= 2 and parts[0] in ("company", "in") and not any(
+                    x in "/" + path for x in LI_SKIP):
+                return "linkedin", f"https://www.linkedin.com/{parts[0]}/{parts[1]}"
+            return None
+
+        if _host_is(host, "x.com") or _host_is(host, "twitter.com"):
+            if not parts or parts[0].lower() in X_SKIP or "status" in parts:
+                return None
+            return "twitter", f"https://x.com/{parts[0]}"
     except Exception:
         pass
     return None
@@ -1129,8 +1218,12 @@ def name_from_title(title, platform):
     t = clean(title)
     if platform == "instagram":
         t = t.split(" (@")[0].split(" • ")[0]
+    if platform == "threads":
+        t = t.split(" (@")[0]
+    if platform == "linkedin":
+        t = re.split(r"\s[-|–•·]\s", t)[0]
     t = re.split(r"\s[-|–•·]\s", t)[0]
-    t = re.sub(r"\b(Facebook|Instagram)\b", "", t, flags=re.I).strip(" -|•·")
+    t = re.sub(r"\b(Facebook|Instagram|Threads|LinkedIn|Twitter)\b", "", t, flags=re.I).strip(" -|•·")
     return t[:80]
 
 
@@ -1149,7 +1242,7 @@ def _accept_consent(page):
             btn = page.locator(f'button:has-text("{txt}")')
             if btn.count() > 0:
                 btn.first.click(timeout=2000)
-                time.sleep(1)
+                nap(1)
                 return
         except Exception:
             pass
@@ -1157,9 +1250,10 @@ def _accept_consent(page):
 
 def _google_results(page, q):
     global GOOGLE_BLOCKED
+    check_stop()
     page.goto("https://www.google.com/search?num=20&hl=en&q=" + quote(q),
               timeout=20000, wait_until="domcontentloaded")
-    time.sleep(2)
+    nap(1.5)
     _accept_consent(page)
 
     def blocked():
@@ -1172,12 +1266,12 @@ def _google_results(page, q):
         if not HEADLESS:
             print("   ⚠️ Google showed a captcha. Solve it in the browser (waiting up to 90 seconds)...")
             for _ in range(30):
-                time.sleep(3)
+                nap(3)
                 if not blocked():
                     break
         if blocked():
             GOOGLE_BLOCKED = True
-            print("   ⚠️ Google is blocking us, DuckDuckGo will be used for the rest of this run.")
+            print("   ⚠️ Google is blocking us, Bing / DuckDuckGo will be used for the rest of this run.")
             return []
 
     out = []
@@ -1199,9 +1293,10 @@ def _google_results(page, q):
 
 
 def _ddg_results(page, q):
+    check_stop()
     page.goto("https://html.duckduckgo.com/html/?q=" + quote(q),
               timeout=20000, wait_until="domcontentloaded")
-    time.sleep(2)
+    nap(1.5)
     out = []
     for b in page.locator("div.result").all()[:FALLBACK_MAX_RESULTS * 2]:
         try:
@@ -1216,38 +1311,88 @@ def _ddg_results(page, q):
     return out
 
 
-def search_web(page, q):
+def _decode_bing(href):
+    """Bing sometimes wraps result links (bing.com/ck/a?...&u=a1<base64>)."""
+    try:
+        if "bing.com/ck/a" in href:
+            u = parse_qs(urlparse(href).query).get("u", [""])[0]
+            if u.startswith("a1"):
+                u = u[2:]
+                u += "=" * (-len(u) % 4)
+                return base64.urlsafe_b64decode(u).decode("utf-8", "ignore")
+    except Exception:
+        pass
+    return href
+
+
+def _bing_results(page, q):
+    check_stop()
+    page.goto("https://www.bing.com/search?count=30&setlang=en&q=" + quote(q),
+              timeout=20000, wait_until="domcontentloaded")
+    nap(1.5)
+    _accept_consent(page)
+    out = []
+    for b in page.locator("li.b_algo").all()[:FALLBACK_MAX_RESULTS * 2]:
+        try:
+            a = b.locator("h2 a").first
+            out.append({"title": clean(a.inner_text(timeout=1500)),
+                        "url": _decode_bing(a.get_attribute("href") or ""),
+                        "text": clean(b.inner_text(timeout=1500))})
+        except Exception:
+            continue
+    return out
+
+
+_ENGINE_FUNCS = {"google": _google_results, "bing": _bing_results, "duckduckgo": _ddg_results}
+
+
+def search_web(page, q, merge=False):
+    """Run a web search. With merge=True results of several engines are combined until
+    enough are found (more leads); otherwise the first engine that answers is used."""
+    collected, seen = [], set()
     for engine in SEARCH_ENGINES:
+        check_stop()
         if engine == "google" and GOOGLE_BLOCKED:
             continue
+        func = _ENGINE_FUNCS.get(engine)
+        if not func:
+            continue
         try:
-            results = _google_results(page, q) if engine == "google" else _ddg_results(page, q)
+            results = func(page, q)
         except Exception:
             results = []
-        if results:
-            return results
-    return []
+        for r in results:
+            if r["url"] and r["url"] not in seen:
+                seen.add(r["url"])
+                collected.append(r)
+        if collected and (not merge or len(collected) >= FALLBACK_MAX_RESULTS):
+            break
+    return collected
 
 
-def web_fallback(page, service, city, seen_ids, seen_keys, industry=""):
-    """Find businesses without a website through web search. Only businesses that have just
-    a Facebook / Instagram page (and no website of their own) are kept."""
-    leads = []
+def web_fallback(page, service, city, seen_ids, seen_keys, industry="", out=None):
+    """Find businesses WITHOUT a website from anywhere on the web: Facebook, Instagram, Threads,
+    LinkedIn and X pages found through Google / Bing / DuckDuckGo. A business is kept only if its
+    page does not point to an own website. New leads are appended to `out` as soon as found."""
+    leads = out if out is not None else []
     candidates = {}
-    for q in (f"{service} {city} site:facebook.com", f"{service} {city} site:instagram.com"):
-        for r in search_web(page, q)[:FALLBACK_MAX_RESULTS]:
+
+    queries = [f"{service} {city} site:{site}" for site in FALLBACK_SITES]
+    queries.append(f"{service} {city} facebook instagram linkedin contact")
+    for q in queries:
+        check_stop()
+        for r in search_web(page, q, merge=True)[:FALLBACK_MAX_RESULTS]:
             n = normalize_social(r["url"])
             if not n:
                 continue
             plat, root = n
             if root not in candidates:
                 candidates[root] = (plat, name_from_title(r["title"], plat), r.get("text", ""))
-    print(f"   🔎 Web search fallback: {len(candidates)} social pages found")
+    print(f"   🔎 Web search: {len(candidates)} social pages found")
 
     city_token = city.split(",")[0].strip().lower()
     for root, (plat, name, snippet) in candidates.items():
-        if _job.get("stop"):
-            break
+        check_stop()
         pid = place_id(root)
         if pid in seen_ids or not name:
             continue
@@ -1255,11 +1400,11 @@ def web_fallback(page, service, city, seen_ids, seen_keys, industry=""):
             body, html = "", ""
             try:
                 page.goto(root, timeout=12000, wait_until="domcontentloaded")
-                time.sleep(2)
+                nap(1.5)
                 body = page.inner_text("body")[:6000]
                 html = page.content()
             except Exception:
-                pass
+                check_stop()
             alltext = snippet + "\n" + body
 
             if city_token and city_token not in alltext.lower():
@@ -1282,6 +1427,9 @@ def web_fallback(page, service, city, seen_ids, seen_keys, industry=""):
                 seen_ids.add(pid)
                 continue
 
+            note = notes_text(industry) + f" | Found via web search ({plat})"
+            if plat == "threads":
+                note += f" | Threads: {root}"
             leads.append({
                 "location": city,
                 "lead_type": "No Website",
@@ -1292,17 +1440,17 @@ def web_fallback(page, service, city, seen_ids, seen_keys, industry=""):
                 "address": "",
                 "instagram": root if plat == "instagram" else "",
                 "facebook": root if plat == "facebook" else "",
-                "linkedin": "",
-                "twitter": "",
+                "linkedin": root if plat == "linkedin" else "",
+                "twitter": root if plat == "twitter" else "",
                 "youtube": "",
-                "notes": notes_text(industry) + " | Found via web search",
+                "notes": note,
                 "maps_url": root,
             })
             seen_ids.add(pid)
             seen_keys.add(key)
-            print(f"   🔎 📞 NO-WEBSITE {name[:40]} | {phone or '-'} | {email or '-'}")
+            print(f"   🔎 📞 NO-WEBSITE ({plat}) {name[:40]} | {phone or '-'} | {email or '-'}")
         except Exception as e:
-            print(f"   🔎 ❌ {short_err(e)}")
+            print(f"   🔎 ⚠️ {short_err(e)} (skipped)")
             continue
     return leads
 
@@ -1313,18 +1461,20 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
     saved_upto = 0
     stats = {"saved": 0, "no_contact": 0, "skipped_filter": 0}
     completed = False
+    stopped = False
     try:
         url = f"https://www.google.com/maps/search/{quote(query)}"
         safe_goto(page, url, timeout=60000)
-        time.sleep(4)
+        nap(3)
         _accept_consent(page)
 
         try:
             feed = page.locator('div[role="feed"]')
             if feed.count() > 0:
                 for _ in range(MAX_SCROLLS):
+                    check_stop()
                     feed.evaluate("el => el.scrollTop = el.scrollHeight")
-                    time.sleep(1.5)
+                    nap(1.2)
         except Exception:
             pass
 
@@ -1340,7 +1490,7 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
 
         print(f"   Found {len(places)} places")
         if not places:
-            # Diagnostic: what did Google actually show? (open /debug.png on the web page to see the screenshot)
+            # Diagnostic: what did Google actually show? (open the debug screenshot on the Status page)
             try:
                 print(f"   ⚠️ No places. URL: {page.url[:90]} | Title: {page.title()[:60]}")
                 page.screenshot(path=DEBUG_SHOT)
@@ -1348,24 +1498,26 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
                 pass
 
         for i, place_url in enumerate(places[:MAX_PLACES_PER_QUERY]):
-            if _job.get("stop"):
-                break
+            check_stop()
             pid = place_id(place_url)
             if pid in seen_ids:
                 continue
             try:
-                safe_goto(page, place_url)
+                # 'commit' returns as soon as Google answers; we then wait for the name ourselves.
+                # This avoids the "Page.goto: Timeout exceeded" errors on slow Maps pages.
+                safe_goto(page, place_url, wait_until="commit")
 
                 try:
-                    page.wait_for_selector("h1", timeout=10000)
+                    page.wait_for_selector("h1", timeout=15000)
                     name = clean(page.locator("h1").first.inner_text(timeout=5000))
                 except Exception:
+                    check_stop()
                     print(f"   [{i+1}] ⚠️ page did not load, skipped")
                     continue
                 if not name:
                     print(f"   [{i+1}] ⚠️ no name found, skipped")
                     continue
-                time.sleep(1.5)
+                nap(1.2)
 
                 phone = get_phone(page)
 
@@ -1464,16 +1616,23 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
                     saved_upto = len(leads)
 
             except Exception as e:
-                print(f"   [{i+1}] ❌ {short_err(e)}")
+                check_stop()
+                print(f"   [{i+1}] ⚠️ {short_err(e)} (skipped)")
                 continue
 
-        completed = bool(places) and not _job.get("stop")
+        completed = bool(places)
 
+    except StopJob:
+        stopped = True
     except Exception as e:
         print(f"❌ Failed: {short_err(e)}")
 
+    # always save what was found so far (also when Stop was pressed)
     if saved_upto < len(leads):
         save_leads(leads[saved_upto:])
+
+    if stopped:
+        raise StopJob()
 
     print(f"   📊 This query: saved {stats['saved']} | "
           f"no contact found {stats['no_contact']} | "
@@ -1482,7 +1641,7 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
 
 
 def run_scrape_job():
-    """Same body as original main(), without terminal configure_run."""
+    """Background job started from the web form."""
     global GOOGLE_BLOCKED
     GOOGLE_BLOCKED = False
     with _job_lock:
@@ -1513,82 +1672,97 @@ def run_scrape_job():
         sync_to_crm()
 
         job_print("🌐 Starting browser...")
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=HEADLESS,
-                args=["--disable-blink-features=AutomationControlled",
-                      "--no-sandbox",
-                      "--disable-setuid-sandbox",
-                      "--disable-dev-shm-usage",
-                      "--disable-gpu"],
-            )
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                locale="en-US",
-                user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
-            )
-            context.set_default_navigation_timeout(60000)
-            context.set_default_timeout(30000)
-            if BLOCK_HEAVY_RESOURCES:
-                def _block_heavy(route):
+        pending_done = []
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=HEADLESS,
+                    args=["--disable-blink-features=AutomationControlled",
+                          "--no-sandbox",
+                          "--disable-setuid-sandbox",
+                          "--disable-dev-shm-usage",
+                          "--disable-gpu"],
+                )
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 900},
+                    locale="en-US",
+                    user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+                )
+                context.set_default_navigation_timeout(60000)
+                context.set_default_timeout(30000)
+
+                def _route(route):
                     try:
-                        if route.request.resource_type in ("image", "media", "font"):
+                        if _job.get("stop"):
+                            route.abort()
+                        elif BLOCK_HEAVY_RESOURCES and route.request.resource_type in ("image", "media", "font"):
                             route.abort()
                         else:
                             route.continue_()
                     except Exception:
                         pass
-                context.route("**/*", _block_heavy)
-            page = context.new_page()
-            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-            job_print("✅ Browser ready, starting searches...")
+                context.route("**/*", _route)
+                page = context.new_page()
+                page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                job_print("✅ Browser ready, starting searches...")
 
-            pending_done = []
-            try:
-                for city in LOCATIONS:
-                    if _job.get("stop"):
-                        job_print("⏹ Stopped")
-                        break
-                    for service, industry in SEARCH_TERMS:
-                        if _job.get("stop"):
-                            break
-                        query = f"{service} in {city}"
-                        done_key = query if LEAD_FILTER == "no_website" else query + " [with website]"
-                        if done_key in done_queries:
+                try:
+                    for city in LOCATIONS:
+                        check_stop()
+                        for service, industry in SEARCH_TERMS:
+                            check_stop()
+                            query = f"{service} in {city}"
+                            done_key = query if LEAD_FILTER == "no_website" else query + " [with website]"
+                            if done_key in done_queries:
+                                with _job_lock:
+                                    _job["stats"]["queries_done"] += 1
+                                continue
+
+                            leads, completed = scrape(page, query, city, seen_ids, seen_keys, industry)
+
+                            fb_ran = False
+                            if LEAD_FILTER == "no_website" and \
+                               (WEB_FALLBACK == "always" or (WEB_FALLBACK == "no_leads" and not leads)):
+                                fb_ran = True
+                                fb_leads = []
+                                try:
+                                    web_fallback(page, service, city, seen_ids, seen_keys, industry, out=fb_leads)
+                                finally:
+                                    # saved even when Stop is pressed in the middle
+                                    if fb_leads:
+                                        save_leads(fb_leads)
+
+                            if completed or fb_ran:
+                                done_queries.add(done_key)
+                                pending_done.append(done_key)
                             with _job_lock:
                                 _job["stats"]["queries_done"] += 1
-                            continue
+                            nap(DELAY)
 
-                        leads, completed = scrape(page, query, city, seen_ids, seen_keys, industry)
-
-                        fb_ran = False
-                        if LEAD_FILTER == "no_website" and not _job.get("stop") and \
-                           (WEB_FALLBACK == "always" or (WEB_FALLBACK == "no_leads" and not leads)):
-                            fb_ran = True
-                            fb_leads = web_fallback(page, service, city, seen_ids, seen_keys, industry)
-                            if fb_leads:
-                                save_leads(fb_leads)
-                                leads = leads + fb_leads
-
-                        if (completed or fb_ran) and not _job.get("stop"):
-                            done_queries.add(done_key)
-                            pending_done.append(done_key)
-                        with _job_lock:
-                            _job["stats"]["queries_done"] += 1
-                        time.sleep(DELAY)
-
+                        mark_queries_done(pending_done)
+                        pending_done = []
+                finally:
+                    try:
+                        browser.close()
+                    except BaseException:
+                        pass
+        finally:
+            if pending_done:
+                try:
                     mark_queries_done(pending_done)
-                    pending_done = []
-            finally:
-                if pending_done:
-                    mark_queries_done(pending_done)
-                browser.close()
+                except Exception:
+                    pass
         job_print(f"\n✅ Done! Check file → {OUTPUT_EXCEL}")
+    except StopJob:
+        job_print("\n⏹ Stopped. Everything found so far is saved.")
     except Exception as e:
-        job_print(f"❌ Fatal: {e}")
-        with _job_lock:
-            _job["error"] = str(e)
+        if _job.get("stop"):
+            job_print("\n⏹ Stopped. Everything found so far is saved.")
+        else:
+            job_print(f"❌ Fatal: {short_err(e)}")
+            with _job_lock:
+                _job["error"] = short_err(e)
     finally:
         with _job_lock:
             _job["running"] = False
@@ -1596,139 +1770,382 @@ def run_scrape_job():
 
 # ── Flask ──────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "leads-scraper-key")
+
+# ── login ───────────────────────────────────────────────────────────────────
+# Login works with the username OR the email below. The password is stored only as a hash.
+# To change it on Railway set LOGIN_USER / LOGIN_EMAIL / LOGIN_PASS in Variables.
+from datetime import timedelta
+from functools import wraps
+from werkzeug.security import check_password_hash, generate_password_hash
+
+AUTH_USER = os.environ.get("LOGIN_USER", "venom09798").strip()
+AUTH_EMAIL = os.environ.get("LOGIN_EMAIL", "venom09798@gmail.com").strip()
+_env_pass = os.environ.get("LOGIN_PASS")
+AUTH_HASH = (generate_password_hash(_env_pass, method="pbkdf2:sha256") if _env_pass else
+             "pbkdf2:sha256:1000000$vTayL2p2gyb1SYR2$a0da9531052df0ba668894da191ee26f273a41b97a6611618c781ecbb7d33605")
+
+
+def _load_secret_key():
+    """Cookie signing key: SECRET_KEY variable, else a random key kept in the data folder
+    (never a fixed text from the source code, so nobody can forge a login cookie)."""
+    key = os.environ.get("SECRET_KEY")
+    if key:
+        return key
+    path = os.path.join(DATA_DIR, ".secret_key")
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                saved = f.read().strip()
+            if saved:
+                return saved
+        key = secrets.token_hex(32)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(key)
+        return key
+    except Exception:
+        return secrets.token_hex(32)
+
+
+app.secret_key = _load_secret_key()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
+                  PERMANENT_SESSION_LIFETIME=timedelta(days=30))
+
+_login_fails = {}            # ip -> [failed attempts, locked until]
+MAX_FAILS = 5
+LOCK_SECONDS = 300
+
+
+def _client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return (fwd.split(",")[0].strip() if fwd else request.remote_addr) or "?"
+
+
+def _check_login(identifier, password):
+    ident = (identifier or "").strip().lower()
+    user_ok = hmac.compare_digest(ident, AUTH_USER.lower()) or hmac.compare_digest(ident, AUTH_EMAIL.lower())
+    pass_ok = check_password_hash(AUTH_HASH, password or "")      # always checked (same timing)
+    return user_ok and pass_ok
+
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("auth"):
+            if request.path.startswith("/api/") or request.headers.get("X-Requested-With") == "fetch":
+                return jsonify(error="login required"), 401
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return wrapper
+
+
+LOGIN_PAGE = r"""
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#084F3A"/>
+<title>Sign in · Leads Scraper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--brand:#0B6B4E;--brand-2:#128A66;--dark:#062F23;--ink:#13201A;--muted:#62716A;--line:#DCE4DB;--bad:#B42318;--bad-bg:#FDECEA}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:20px;color:var(--ink);overflow-x:hidden;
+  font:15px/1.5 "Plus Jakarta Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  background:radial-gradient(1100px 600px at 12% -10%,#14996F 0%,transparent 60%),
+             radial-gradient(900px 600px at 100% 110%,#0E7A58 0%,transparent 55%),
+             linear-gradient(160deg,#062F23,#0A4A38 55%,#0B6B4E)}
+.orb{position:fixed;border-radius:50%;filter:blur(60px);opacity:.35;pointer-events:none;animation:float 14s ease-in-out infinite}
+.orb.a{width:280px;height:280px;background:#35D399;top:-80px;right:-60px}
+.orb.b{width:240px;height:240px;background:#0E7A58;bottom:-80px;left:-60px;animation-delay:-6s}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(24px)}}
+@media (prefers-reduced-motion:reduce){.orb{animation:none}}
+.box{position:relative;width:100%;max-width:410px;background:#fff;border-radius:26px;padding:34px 30px 28px;
+  box-shadow:0 30px 80px rgba(0,0,0,.35),0 0 0 1px rgba(255,255,255,.06)}
+.logo{width:56px;height:56px;border-radius:17px;background:linear-gradient(135deg,var(--brand),var(--brand-2));display:grid;place-items:center;
+  margin:0 auto 16px;box-shadow:0 10px 24px rgba(11,107,78,.35)}
+.logo svg{width:28px;height:28px}
+h1{margin:0;text-align:center;font-size:1.55rem;font-weight:800;letter-spacing:-.025em}
+.sub{margin:6px 0 24px;text-align:center;color:var(--muted);font-size:.9rem}
+.err{background:var(--bad-bg);color:var(--bad);border-radius:12px;padding:11px 14px;margin-bottom:16px;font-weight:600;font-size:.88rem}
+label.lbl{display:block;font-size:.8rem;font-weight:700;margin:0 0 6px;color:#2B3B33}
+.inp{position:relative;margin-bottom:16px}
+.inp svg.ic{position:absolute;left:14px;top:50%;transform:translateY(-50%);width:18px;height:18px;stroke:#8A9A92;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+.inp input{width:100%;padding:13px 44px 13px 42px;border:1.5px solid var(--line);border-radius:13px;font:inherit;font-size:16px;background:#F8FAF8;color:var(--ink);transition:border-color .15s,background .15s}
+.inp input:focus{outline:none;border-color:var(--brand);background:#fff;box-shadow:0 0 0 4px rgba(18,138,102,.15)}
+.eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:0;padding:8px;cursor:pointer;border-radius:10px;color:#8A9A92;display:grid;place-items:center}
+.eye:hover{background:#EDF2EC;color:var(--brand)}
+.eye svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.row{display:flex;align-items:center;justify-content:space-between;margin:2px 0 20px;font-size:.85rem;color:var(--muted);font-weight:600}
+.row label{display:flex;align-items:center;gap:8px;cursor:pointer}
+.row input{width:17px;height:17px;accent-color:var(--brand)}
+button.go{width:100%;padding:14px;border:0;border-radius:14px;font:inherit;font-weight:800;font-size:1rem;color:#fff;cursor:pointer;
+  background:linear-gradient(135deg,var(--brand),var(--brand-2));box-shadow:0 10px 24px rgba(11,107,78,.35);transition:transform .1s,box-shadow .15s}
+button.go:hover{box-shadow:0 14px 30px rgba(11,107,78,.42)}
+button.go:active{transform:translateY(1px)}
+button.go:focus-visible,.eye:focus-visible{outline:3px solid #86D4B6;outline-offset:2px}
+.foot{margin:20px 0 0;text-align:center;color:#8A9A92;font-size:.78rem}
+@media (max-width:420px){.box{padding:28px 20px 22px;border-radius:22px}h1{font-size:1.4rem}}
+</style></head><body>
+<div class="orb a"></div><div class="orb b"></div>
+<main class="box">
+  <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v6M8 11h6"/></svg></div>
+  <h1>Welcome back</h1>
+  <p class="sub">Sign in to open Leads Scraper</p>
+
+  {% if error %}<div class="err" role="alert">{{ error }}</div>{% endif %}
+
+  <form method="post" action="{{ url_for('login') }}" autocomplete="on">
+    <input type="hidden" name="next" value="{{ nxt }}">
+    <label class="lbl" for="u">Username or email</label>
+    <div class="inp">
+      <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg>
+      <input id="u" name="identifier" type="text" value="{{ ident }}" placeholder="username or email" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+    </div>
+    <label class="lbl" for="p">Password</label>
+    <div class="inp">
+      <svg class="ic" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+      <input id="p" name="password" type="password" placeholder="••••••••" autocomplete="current-password" required>
+      <button class="eye" type="button" id="eye" aria-label="Show password">
+        <svg viewBox="0 0 24 24"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>
+      </button>
+    </div>
+    <div class="row"><label><input type="checkbox" name="remember" value="1" checked> Keep me signed in</label></div>
+    <button class="go" type="submit">Sign in</button>
+  </form>
+  <p class="foot">Private access only</p>
+</main>
+<script>
+(function(){
+  var p=document.getElementById("p"), b=document.getElementById("eye");
+  b.addEventListener("click", function(){
+    var show = p.type === "password";
+    p.type = show ? "text" : "password";
+    b.setAttribute("aria-label", show ? "Hide password" : "Show password");
+  });
+})();
+</script>
+</body></html>
+"""
+
+
+def _safe_next(nxt):
+    nxt = nxt or ""
+    return nxt if nxt.startswith("/") and not nxt.startswith("//") and "\\" not in nxt else ""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("auth"):
+        return redirect(url_for("index"))
+    error, ident = "", ""
+    nxt = _safe_next(request.values.get("next", ""))
+    if request.method == "POST":
+        ip = _client_ip()
+        fails, locked_until = _login_fails.get(ip, [0, 0])
+        now = time.time()
+        ident = request.form.get("identifier", "")
+        if locked_until > now:
+            wait = int(locked_until - now) // 60 + 1
+            error = f"Too many failed attempts. Try again in {wait} min."
+        elif _check_login(ident, request.form.get("password", "")):
+            _login_fails.pop(ip, None)
+            session.clear()
+            session["auth"] = True
+            session.permanent = bool(request.form.get("remember"))
+            return redirect(nxt or url_for("index"))
+        else:
+            fails += 1
+            if fails >= MAX_FAILS:
+                _login_fails[ip] = [0, now + LOCK_SECONDS]
+                error = "Too many failed attempts. Try again in 5 min."
+            else:
+                _login_fails[ip] = [fails, 0]
+                error = "Wrong username/email or password."
+    return render_template_string(LOGIN_PAGE, error=error, ident=ident, nxt=nxt)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 PAGE = r"""
 <!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#0B5C45"/>
 <title>Leads Scraper</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{
-  --ground:#EDF0EB; --panel:#FFFFFF; --ink:#16211C; --muted:#5C6A63; --line:#D8DFD6;
-  --brand:#0E6B50; --brand-dark:#0A523D; --tint:#E1F0E8;
-  --warn:#B7791F; --bad:#B42318; --console:#0F1A17; --console-line:#22332D;
+  --bg:#F3F5F2; --card:#FFFFFF; --ink:#13201A; --muted:#62716A; --line:#E0E6DF;
+  --brand:#0B6B4E; --brand-2:#128A66; --brand-dark:#084F3A; --tint:#E3F3EB;
+  --bad:#B42318; --bad-bg:#FDECEA; --warn:#B7791F;
+  --console:#0E1915; --console-line:#21322B;
+  --shadow:0 1px 2px rgba(19,32,26,.06),0 6px 20px rgba(19,32,26,.05);
 }
 *{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--ground);color:var(--ink);overflow-x:hidden;
-  font:15px/1.5 "Instrument Sans",system-ui,-apple-system,"Segoe UI",sans-serif}
-.wrap{max-width:900px;margin:0 auto;padding:28px 20px 56px}
-header.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px;flex-wrap:wrap}
-header.top h1{margin:0;font-size:1.55rem;font-weight:700;letter-spacing:-.02em}
-header.top p{margin:2px 0 0;color:var(--muted);font-size:.9rem}
-nav.tabs{display:flex;gap:4px;background:#DFE5DD;padding:4px;border-radius:12px}
-nav.tabs a{padding:7px 16px;border-radius:9px;color:var(--muted);text-decoration:none;font-weight:600;font-size:.9rem;text-align:center}
-nav.tabs a.on{background:var(--panel);color:var(--ink);box-shadow:0 1px 2px rgba(22,33,28,.12)}
-nav.tabs a:focus-visible,.btn:focus-visible,button:focus-visible{outline:3px solid #7FC4A8;outline-offset:2px}
-.opt input:focus-visible+span{outline:3px solid #7FC4A8;outline-offset:2px}
+html{-webkit-text-size-adjust:100%;scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--ink);overflow-x:hidden;
+  font:15px/1.5 "Plus Jakarta Sans",system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:inherit}
+.wrap{max-width:860px;margin:0 auto;padding:0 18px 48px}
 
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:22px 24px;margin-bottom:16px}
-.panel h2{margin:0 0 4px;font-size:1rem;font-weight:700}
-.panel .hint{margin:0 0 14px;color:var(--muted);font-size:.86rem}
+/* ---- top bar ---- */
+.hero{background:linear-gradient(135deg,var(--brand-dark),var(--brand) 55%,var(--brand-2));color:#fff;
+  padding:26px 0 70px;margin-bottom:-48px}
+.hero .wrap{padding-bottom:0}
+.hero-row{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:42px;height:42px;border-radius:12px;background:rgba(255,255,255,.16);display:grid;place-items:center;flex:none}
+.logo svg{width:22px;height:22px}
+.hero h1{margin:0;font-size:1.4rem;font-weight:800;letter-spacing:-.02em;line-height:1.2}
+.hero p{margin:2px 0 0;font-size:.85rem;opacity:.82}
+nav.tabs{display:flex;gap:4px;background:rgba(0,0,0,.2);padding:4px;border-radius:12px}
+nav.tabs a{padding:8px 18px;border-radius:9px;color:rgba(255,255,255,.85);text-decoration:none;font-weight:600;font-size:.88rem;text-align:center}
+nav.tabs a.on{background:#fff;color:var(--brand-dark)}
+a:focus-visible,button:focus-visible,.opt input:focus-visible+span{outline:3px solid #86D4B6;outline-offset:2px}
 
-.flash{padding:11px 16px;border-radius:12px;margin-bottom:14px;background:var(--tint);color:var(--brand-dark);font-weight:500}
-.flash.err{background:#FDECEA;color:var(--bad)}
+.flash{padding:12px 16px;border-radius:12px;margin-bottom:14px;background:var(--tint);color:var(--brand-dark);font-weight:600;box-shadow:var(--shadow)}
+.flash.err{background:var(--bad-bg);color:var(--bad)}
 
-/* option chips: checkbox/radio sit invisibly on top of the label text */
+/* ---- cards ---- */
+.card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px;margin-bottom:14px;box-shadow:var(--shadow)}
+.card-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:14px}
+.num{width:28px;height:28px;border-radius:9px;background:var(--tint);color:var(--brand-dark);font-weight:800;font-size:.85rem;display:grid;place-items:center;flex:none;margin-top:1px}
+.card-head h2{margin:0;font-size:1.02rem;font-weight:700;line-height:1.3}
+.card-head p{margin:2px 0 0;color:var(--muted);font-size:.84rem}
+.card-head .grow{flex:1;min-width:0}
+.mini{display:flex;gap:6px;flex:none}
+.mini button{background:none;border:0;color:var(--brand);font:inherit;font-size:.8rem;font-weight:700;padding:4px 6px;cursor:pointer;border-radius:8px}
+.mini button:hover{background:var(--tint)}
+
+/* ---- option chips ---- */
 .opts{display:flex;flex-wrap:wrap;gap:8px}
 .opt{position:relative;cursor:pointer;max-width:100%}
 .opt input{position:absolute;opacity:0;inset:0;width:100%;height:100%;margin:0;cursor:pointer}
-.opt span{display:inline-block;max-width:100%;padding:8px 14px;border:1px solid var(--line);border-radius:999px;background:#FAFBF9;
-  font-size:.9rem;font-weight:500;transition:background .12s,border-color .12s,color .12s}
-.opt:hover span{border-color:#B6C4B9}
+.opt span{display:inline-flex;align-items:center;gap:7px;max-width:100%;padding:9px 15px;border:1.5px solid var(--line);border-radius:999px;background:#FAFBF9;
+  font-size:.88rem;font-weight:600;transition:background .12s,border-color .12s,color .12s}
+.opt:hover span{border-color:#B3C4B8}
 .opt input:checked+span{background:var(--brand);border-color:var(--brand);color:#fff}
-.opts.big .opt span{border-radius:12px;padding:12px 18px;font-size:.95rem}
+.opt input:checked+span::before{content:"✓";font-size:.8rem}
 
-.field{width:100%;margin-top:12px;padding:11px 14px;border:1px solid var(--line);border-radius:10px;
+/* big radio cards */
+.choice{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.choice .opt span{display:block;width:100%;border-radius:16px;padding:14px 16px;border-width:2px}
+.choice .opt b{display:block;font-size:.98rem;margin-bottom:2px}
+.choice .opt small{display:block;font-weight:500;font-size:.8rem;color:var(--muted);line-height:1.35}
+.choice .opt input:checked+span{background:var(--tint);border-color:var(--brand);color:var(--ink)}
+.choice .opt input:checked+span::before{content:none}
+.choice .opt input:checked+span small{color:var(--brand-dark)}
+
+.field{width:100%;margin-top:12px;padding:12px 14px;border:1.5px solid var(--line);border-radius:12px;
   font:inherit;font-size:16px;background:#FAFBF9;color:var(--ink)}
-.field:focus{outline:3px solid #7FC4A8;outline-offset:1px;border-color:var(--brand)}
+.field:focus{outline:3px solid #86D4B6;outline-offset:1px;border-color:var(--brand)}
 #customBox{display:none}
 #customBox.show{display:block}
 
-.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:6px}
-button,.btn{font:inherit;font-weight:600;border:1px solid transparent;border-radius:10px;padding:11px 20px;
-  cursor:pointer;text-decoration:none;display:inline-block;line-height:1.2;text-align:center}
+/* ---- buttons ---- */
+button,.btn{font:inherit;font-weight:700;border:1.5px solid transparent;border-radius:12px;padding:12px 22px;
+  cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;gap:8px;line-height:1.2;text-align:center}
 .btn.primary,button.primary{background:var(--brand);color:#fff}
 .btn.primary:hover,button.primary:hover{background:var(--brand-dark)}
-.btn.ghost,button.ghost{background:var(--panel);color:var(--ink);border-color:var(--line)}
-.btn.ghost:hover,button.ghost:hover{border-color:#B6C4B9}
-button.danger{background:#FDECEA;color:var(--bad);border-color:#F4C7C2}
-button:disabled{opacity:.45;cursor:not-allowed}
+.btn.ghost,button.ghost{background:var(--card);color:var(--ink);border-color:var(--line)}
+.btn.ghost:hover,button.ghost:hover{border-color:#B3C4B8}
+button.danger{background:var(--bad);color:#fff}
+button.danger:hover{background:#8F1B12}
+button:disabled{opacity:.5;cursor:not-allowed}
 
-/* status */
-.state{display:flex;align-items:center;gap:10px;font-weight:700;font-size:1.1rem}
-.dot{width:11px;height:11px;border-radius:50%;background:#9AA7A0;flex:none}
-.dot.run{background:var(--brand);animation:pulse 1.6s ease-in-out infinite}
-@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(14,107,80,.45)}50%{box-shadow:0 0 0 7px rgba(14,107,80,0)}}
-@media (prefers-reduced-motion:reduce){.dot.run{animation:none}.bar i{transition:none}}
-.summary{color:var(--muted);margin:6px 0 18px;font-size:.9rem;overflow-wrap:anywhere}
-.bar{height:10px;background:#E4E9E2;border-radius:999px;overflow:hidden}
-.bar i{display:block;height:100%;width:0;background:var(--brand);border-radius:999px;transition:width .6s ease}
+.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.dock{position:sticky;bottom:0;z-index:20;margin:0 -18px;padding:12px 18px calc(12px + env(safe-area-inset-bottom));
+  background:linear-gradient(to top,var(--bg) 70%,rgba(243,245,242,0));}
+.dock .actions{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:10px;box-shadow:var(--shadow)}
+.dock .primary{flex:1 1 auto;min-width:160px}
+
+/* ---- status ---- */
+.state{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.2rem;letter-spacing:-.01em}
+.dot{width:12px;height:12px;border-radius:50%;background:#9AA7A0;flex:none}
+.dot.run{background:var(--brand-2);animation:pulse 1.6s ease-in-out infinite}
+.dot.stopping{background:var(--warn);animation:pulse 0.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(18,138,102,.45)}50%{box-shadow:0 0 0 8px rgba(18,138,102,0)}}
+@media (prefers-reduced-motion:reduce){.dot.run,.dot.stopping{animation:none}.bar i{transition:none}}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 18px}
+.chips span{background:#F1F5F0;border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:.78rem;font-weight:600;color:var(--muted)}
+.bar{height:12px;background:#E6EBE4;border-radius:999px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--brand),#2FB587);border-radius:999px;transition:width .6s ease}
+.pct{display:flex;justify-content:space-between;color:var(--muted);font-size:.8rem;font-weight:600;margin:7px 0 0}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:18px 0}
-.stat{background:#F6F8F5;border:1px solid var(--line);border-radius:12px;padding:12px 16px;min-width:0}
-.stat b{display:block;font-size:1.65rem;line-height:1.15;letter-spacing:-.02em}
-.stat small{color:var(--muted);font-size:.82rem}
-.err-box{background:#FDECEA;color:var(--bad);border-radius:12px;padding:10px 14px;margin-bottom:14px;display:none;overflow-wrap:anywhere}
+.stat{background:#F6F8F5;border:1px solid var(--line);border-radius:16px;padding:14px 16px;min-width:0}
+.stat b{display:block;font-size:1.8rem;line-height:1.1;letter-spacing:-.03em;font-weight:800}
+.stat small{color:var(--muted);font-size:.8rem;font-weight:600}
+.stat.hl{background:var(--tint);border-color:#C5E3D4}
+.stat.hl b{color:var(--brand-dark)}
+.err-box{background:var(--bad-bg);color:var(--bad);border-radius:12px;padding:10px 14px;margin-bottom:14px;display:none;overflow-wrap:anywhere;font-weight:600}
 
-.console{background:var(--console);border-radius:18px;overflow:hidden;margin-top:16px}
-.console .bar2{display:flex;justify-content:space-between;align-items:center;padding:10px 18px;
-  border-bottom:1px solid var(--console-line);color:#8FA79C;font-size:.82rem}
-#log{font:12.5px/1.6 "JetBrains Mono",ui-monospace,Consolas,monospace;color:#D5E3DC;padding:14px 18px;
-  height:440px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-overflow-scrolling:touch}
+.console{background:var(--console);border-radius:20px;overflow:hidden;margin-top:14px;box-shadow:var(--shadow)}
+.console .bar2{display:flex;justify-content:space-between;align-items:center;padding:11px 18px;
+  border-bottom:1px solid var(--console-line);color:#8FA79C;font-size:.8rem;font-weight:600}
+.console .bar2 .live{display:flex;align-items:center;gap:7px}
+.console .bar2 .live i{width:8px;height:8px;border-radius:50%;background:#35D399}
+#log{font:12.5px/1.65 "JetBrains Mono",ui-monospace,Consolas,monospace;color:#D5E3DC;padding:14px 18px;
+  height:460px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-overflow-scrolling:touch}
 #log div{padding:0 0 0 10px;border-left:2px solid transparent}
 #log .ok{color:#7FE0B0}
 #log .warn{color:#F2C26B}
 #log .bad{color:#FF8D82;border-left-color:#FF8D82}
 #log .q{color:#fff;font-weight:500;margin-top:8px}
 
-/* ---------- mobile ---------- */
+/* ---- mobile ---- */
 @media (max-width:640px){
-  body{font-size:15px}
-  .wrap{padding:16px 14px calc(40px + env(safe-area-inset-bottom))}
-  header.top{flex-direction:column;align-items:stretch;gap:12px;margin-bottom:16px}
-  header.top h1{font-size:1.35rem}
+  .wrap{padding:0 14px 40px}
+  .hero{padding:18px 0 62px}
+  .hero-row{flex-direction:column;align-items:stretch;gap:14px}
+  .hero h1{font-size:1.25rem}
   nav.tabs{width:100%}
-  nav.tabs a{flex:1;padding:9px 10px}
-  .panel{padding:16px 14px;border-radius:14px;margin-bottom:12px}
+  nav.tabs a{flex:1;padding:10px 8px}
+  .card{padding:16px 14px;border-radius:16px;margin-bottom:12px}
+  .choice{grid-template-columns:1fr}
   .opts{gap:7px}
-  .opt span{padding:9px 13px;font-size:.88rem}
-  .opts.big{flex-direction:column}
-  .opts.big .opt span{display:block;width:100%;text-align:center}
+  .opt span{padding:9px 13px;font-size:.86rem}
+  .dock{margin:0 -14px;padding:10px 14px calc(10px + env(safe-area-inset-bottom))}
+  .dock .actions .btn,.dock .actions button{flex:1 1 calc(50% - 6px)}
+  .dock .actions .primary{flex-basis:100%}
   .stats{gap:8px}
-  .stat{padding:10px 10px}
-  .stat b{font-size:1.3rem}
-  .stat small{font-size:.76rem}
-  .actions{gap:8px}
-  .actions .btn,.actions button{flex:1 1 calc(50% - 8px);padding:12px 10px}
-  .actions form{display:contents}
-  .actions.sticky{position:sticky;bottom:0;z-index:5;margin:0 -14px;padding:10px 14px calc(10px + env(safe-area-inset-bottom));
-    background:rgba(237,240,235,.96);border-top:1px solid var(--line)}
-  .actions.sticky .primary{flex-basis:100%}
-  .console{border-radius:14px}
-  .console .bar2{padding:9px 14px}
-  #log{height:55vh;min-height:280px;padding:12px 12px;font-size:11.5px}
+  .stat{padding:11px 11px}
+  .stat b{font-size:1.35rem}
+  .stat small{font-size:.74rem}
+  .status-actions .btn,.status-actions button{flex:1 1 calc(50% - 6px)}
+  .console{border-radius:16px}
+  .console .bar2{padding:10px 14px}
+  #log{height:55vh;min-height:300px;padding:12px;font-size:11.5px}
 }
-@media (max-width:360px){
-  .stats{grid-template-columns:1fr}
-}
+@media (max-width:360px){.stats{grid-template-columns:1fr}}
 </style></head><body>
-<div class="wrap">
 
-<header class="top">
-  <div>
-    <h1>Leads Scraper</h1>
-    <p>Find businesses on Google Maps and save their contact details</p>
+<div class="hero"><div class="wrap">
+  <div class="hero-row">
+    <div class="brand">
+      <div class="logo"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M11 8v6M8 11h6"/></svg></div>
+      <div>
+        <h1>Leads Scraper</h1>
+        <p>Find businesses and save their contact details</p>
+      </div>
+    </div>
+    <nav class="tabs">
+      <a href="{{ url_for('index') }}" class="{% if page=='form' %}on{% endif %}">Setup</a>
+      <a href="{{ url_for('status') }}" class="{% if page!='form' %}on{% endif %}">Status{% if running %} ●{% endif %}</a>
+      <a href="{{ url_for('logout') }}">Logout</a>
+    </nav>
   </div>
-  <nav class="tabs">
-    <a href="{{ url_for('index') }}" class="{% if page=='form' %}on{% endif %}">Setup</a>
-    <a href="{{ url_for('status') }}" class="{% if page!='form' %}on{% endif %}">Status</a>
-  </nav>
-</header>
+</div></div>
+
+<div class="wrap">
 
 {% with msgs = get_flashed_messages(with_categories=1) %}
   {% for c,m in msgs %}<div class="flash {% if c=='error' %}err{% endif %}">{{ m }}</div>{% endfor %}
@@ -1737,18 +2154,17 @@ button:disabled{opacity:.45;cursor:not-allowed}
 {% if page=='form' %}
 <form method="post" action="{{ url_for('start') }}">
 
-  <section class="panel">
-    <h2>Lead type</h2>
-    <p class="hint">Which businesses do you want to collect?</p>
-    <div class="opts big">
-      <label class="opt"><input type="radio" name="lead_type" value="1" checked><span>Without a website</span></label>
-      <label class="opt"><input type="radio" name="lead_type" value="2"><span>With a website</span></label>
+  <section class="card">
+    <div class="card-head"><div class="num">1</div><div class="grow"><h2>Lead type</h2><p>Which businesses do you want to collect?</p></div></div>
+    <div class="choice">
+      <label class="opt"><input type="radio" name="lead_type" value="1" checked><span><b>Without a website</b><small>Maps + Facebook, Instagram, Threads, LinkedIn, X</small></span></label>
+      <label class="opt"><input type="radio" name="lead_type" value="2"><span><b>With a website</b><small>Google Maps businesses that have a site</small></span></label>
     </div>
   </section>
 
-  <section class="panel">
-    <h2>Regions</h2>
-    <p class="hint">Pick one or more countries to search.</p>
+  <section class="card">
+    <div class="card-head"><div class="num">2</div><div class="grow"><h2>Regions</h2><p>Pick one or more countries to search.</p></div>
+      <div class="mini"><button type="button" data-all="regions">All</button><button type="button" data-none="regions">None</button></div></div>
     <div class="opts">
       {% for r in regions %}
       <label class="opt"><input type="checkbox" name="regions" value="{{ r }}" {% if r=='UK' %}checked{% endif %}><span>{{ r }}</span></label>
@@ -1756,9 +2172,9 @@ button:disabled{opacity:.45;cursor:not-allowed}
     </div>
   </section>
 
-  <section class="panel">
-    <h2>Industries</h2>
-    <p class="hint">Each industry searches several related business types.</p>
+  <section class="card">
+    <div class="card-head"><div class="num">3</div><div class="grow"><h2>Industries</h2><p>Each industry searches several related business types.</p></div>
+      <div class="mini"><button type="button" data-all="industries">All</button><button type="button" data-none="industries">None</button></div></div>
     <div class="opts">
       {% for k,v in industries.items() %}
       <label class="opt"><input type="checkbox" name="industries" value="{{ k }}" {% if k=='1' %}checked{% endif %}><span>{{ v[0] }}</span></label>
@@ -1770,9 +2186,8 @@ button:disabled{opacity:.45;cursor:not-allowed}
     </div>
   </section>
 
-  <section class="panel">
-    <h2>Services you offer</h2>
-    <p class="hint">Saved in each lead's notes.</p>
+  <section class="card">
+    <div class="card-head"><div class="num">4</div><div class="grow"><h2>Services you offer</h2><p>Saved in each lead's notes.</p></div></div>
     <div class="opts">
       {% for k,v in services.items() %}
       <label class="opt"><input type="checkbox" name="offers" value="{{ k }}" checked><span>{{ v }}</span></label>
@@ -1780,24 +2195,32 @@ button:disabled{opacity:.45;cursor:not-allowed}
     </div>
   </section>
 
-  <div class="actions sticky">
-    <button class="primary" type="submit" {% if running %}disabled{% endif %}>Start scrape</button>
+  <div class="dock"><div class="actions">
+    <button class="primary" type="submit" {% if running %}disabled{% endif %}>▶ Start scrape</button>
     {% if running %}<a class="btn ghost" href="{{ url_for('status') }}">View running scrape</a>{% endif %}
-    {% if excel %}<a class="btn ghost" href="{{ url_for('download') }}">Download Excel</a>{% endif %}
-  </div>
+    {% if excel %}<a class="btn ghost" href="{{ url_for('download') }}">⬇ Download Excel</a>{% endif %}
+  </div></div>
 </form>
 <script>
 (function(){
   var t=document.getElementById("customToggle"), b=document.getElementById("customBox");
   function sync(){ b.classList.toggle("show", t.checked); }
   t.addEventListener("change", sync); sync();
+  document.querySelectorAll("[data-all],[data-none]").forEach(function(btn){
+    btn.addEventListener("click", function(){
+      var name = btn.getAttribute("data-all") || btn.getAttribute("data-none");
+      var on = btn.hasAttribute("data-all");
+      document.querySelectorAll('input[name="'+name+'"]').forEach(function(i){ i.checked = on; });
+      sync();
+    });
+  });
 })();
 </script>
 
 {% else %}
-<section class="panel">
+<section class="card">
   <div class="state"><span class="dot {% if running %}run{% endif %}" id="dot"></span><span id="st">{{ 'Running' if running else 'Idle' }}</span></div>
-  <p class="summary">{{ summary }}</p>
+  <div class="chips" id="chips"></div>
 
   <div class="err-box" id="errbox"></div>
 
@@ -1805,35 +2228,43 @@ button:disabled{opacity:.45;cursor:not-allowed}
        aria-valuenow="{{ ((stats.queries_done / stats.queries_total * 100) if stats.queries_total else 0)|round|int }}">
     <i id="bar" style="width:{{ ((stats.queries_done / stats.queries_total * 100) if stats.queries_total else 0) }}%"></i>
   </div>
+  <div class="pct"><span id="pct"></span><span id="pct2"></span></div>
 
   <div class="stats">
-    <div class="stat"><b id="sv">{{ stats.saved }}</b><small>Leads saved</small></div>
+    <div class="stat hl"><b id="sv">{{ stats.saved }}</b><small>Leads saved</small></div>
     <div class="stat"><b id="qd">{{ stats.queries_done }}</b><small>Searches done</small></div>
     <div class="stat"><b id="qt">{{ stats.queries_total }}</b><small>Searches total</small></div>
   </div>
 
-  <div class="actions">
-    {% if running %}
-    <form method="post" action="{{ url_for('stop') }}" style="display:inline"><button class="danger" type="submit">Stop scrape</button></form>
-    {% endif %}
+  <div class="actions status-actions">
+    <button class="danger" type="button" id="stopBtn" {% if not running %}style="display:none"{% endif %}>■ Stop</button>
     <a class="btn ghost" href="{{ url_for('index') }}">Change setup</a>
-    {% if excel %}<a class="btn primary" href="{{ url_for('download') }}">Download Excel</a>{% endif %}
+    {% if excel %}<a class="btn primary" href="{{ url_for('download') }}">⬇ Download Excel</a>{% endif %}
     {% if debug_shot %}<a class="btn ghost" href="{{ url_for('debug_png') }}" target="_blank">Debug screenshot</a>{% endif %}
   </div>
 </section>
 
 <div class="console">
-  <div class="bar2"><span>Live log</span><span id="pct"></span></div>
+  <div class="bar2"><span class="live"><i></i>Live log</span><span>updates every 2s</span></div>
   <div id="log"></div>
 </div>
 
 <script>
 var INITIAL = {{ log|tojson }};
+var SUMMARY = {{ summary|tojson }};
+
+(function(){
+  var box = document.getElementById("chips");
+  (SUMMARY || "").split("|").forEach(function(s){
+    s = s.trim(); if(!s || s === "—") return;
+    var e = document.createElement("span"); e.textContent = s; box.appendChild(e);
+  });
+})();
 
 function lineClass(l){
   if (/❌|Fatal/.test(l)) return "bad";
   if (/⚠️/.test(l)) return "warn";
-  if (/💾|📡|✅|NO-WEBSITE|HAS-WEBSITE/.test(l)) return "ok";
+  if (/💾|📡|✅|⏹|NO-WEBSITE|HAS-WEBSITE/.test(l)) return "ok";
   if (/^\s*🔍 \[/.test(l)) return "q";
   return "";
 }
@@ -1852,6 +2283,8 @@ function renderLog(lines){
   if (atEnd) el.scrollTop = el.scrollHeight;
 }
 
+var stopBtn = document.getElementById("stopBtn");
+
 function setStats(d){
   var done = d.stats.queries_done, total = d.stats.queries_total;
   var pct = total ? Math.min(100, done / total * 100) : 0;
@@ -1860,21 +2293,38 @@ function setStats(d){
   document.getElementById("qt").textContent = total;
   document.getElementById("bar").style.width = pct + "%";
   document.getElementById("pct").textContent = total ? pct.toFixed(1) + "% of searches" : "";
-  document.getElementById("st").textContent = d.running ? "Running" : "Idle";
-  document.getElementById("dot").className = "dot" + (d.running ? " run" : "");
+  document.getElementById("pct2").textContent = total ? done + " / " + total : "";
+  var label = d.stopping ? "Stopping…" : (d.running ? "Running" : "Idle");
+  document.getElementById("st").textContent = label;
+  document.getElementById("dot").className = "dot" + (d.stopping ? " stopping" : (d.running ? " run" : ""));
+  stopBtn.style.display = d.running ? "" : "none";
+  if (!d.stopping) { stopBtn.disabled = false; stopBtn.textContent = "■ Stop"; }
   var eb = document.getElementById("errbox");
   if (d.error){ eb.textContent = d.error; eb.style.display = "block"; } else { eb.style.display = "none"; }
 }
 
+stopBtn.addEventListener("click", function(){
+  stopBtn.disabled = true; stopBtn.textContent = "Stopping…";
+  document.getElementById("st").textContent = "Stopping…";
+  document.getElementById("dot").className = "dot stopping";
+  fetch("{{ url_for('stop') }}", {method:"POST", headers:{"X-Requested-With":"fetch"}})
+    .then(function(){ poll(true); });
+});
+
 renderLog(INITIAL.split("\n"));
 document.getElementById("log").scrollTop = 1e9;
 
-function poll(){
-  fetch("{{ url_for('api_status') }}").then(function(r){return r.json();}).then(function(d){
-    setStats(d);
-    renderLog(d.log);
-    setTimeout(poll, 3000);
-  }).catch(function(){ setTimeout(poll, 5000); });
+var timer = null;
+function poll(once){
+  clearTimeout(timer);
+  fetch("{{ url_for('api_status') }}").then(function(r){
+    if (r.status === 401) { location.href = "{{ url_for('login') }}"; throw new Error("login"); }
+    return r.json();
+  }).then(function(d){
+    setStats(d); renderLog(d.log);
+    if (!once) timer = setTimeout(poll, d.stopping ? 700 : 2000);
+    else timer = setTimeout(poll, 700);
+  }).catch(function(){ timer = setTimeout(poll, 4000); });
 }
 poll();
 </script>
@@ -1886,6 +2336,7 @@ poll();
 
 
 @app.route("/")
+@login_required
 def index():
     return render_template_string(
         PAGE, page="form",
@@ -1898,6 +2349,7 @@ def index():
 
 
 @app.route("/start", methods=["POST"])
+@login_required
 def start():
     if _job["running"]:
         flash("Already running.", "error")
@@ -1914,14 +2366,19 @@ def start():
 
 
 @app.route("/stop", methods=["POST"])
+@login_required
 def stop():
     with _job_lock:
         _job["stop"] = True
-    flash("Stop requested.", "success")
+    kill_browser()          # closes Chromium at once so the scraper stops immediately
+    if request.headers.get("X-Requested-With") == "fetch":
+        return jsonify(ok=True)
+    flash("Stopping...", "success")
     return redirect(url_for("status"))
 
 
 @app.route("/status")
+@login_required
 def status():
     with _job_lock:
         return render_template_string(
@@ -1936,12 +2393,16 @@ def status():
 
 
 @app.route("/api/status")
+@login_required
 def api_status():
     with _job_lock:
-        return jsonify(running=_job["running"], stats=_job["stats"], log=_job["log"][-200:], error=_job["error"])
+        return jsonify(running=_job["running"],
+                       stopping=bool(_job["running"] and _job["stop"]),
+                       stats=_job["stats"], log=_job["log"][-200:], error=_job["error"])
 
 
 @app.route("/download")
+@login_required
 def download():
     if not os.path.exists(OUTPUT_EXCEL):
         flash("No Excel yet.", "error")
@@ -1950,6 +2411,7 @@ def download():
 
 
 @app.route("/debug.png")
+@login_required
 def debug_png():
     if not os.path.exists(DEBUG_SHOT):
         flash("No debug screenshot yet.", "error")
