@@ -1,19 +1,20 @@
 """
 Leads Scraper — Flask version (Railway / Docker ready)
-Setup form in browser, scrape runs in background.
+Setup form in browser, scrape runs in background. Single file (design is built in).
 
 Sources : Google Maps + Google / DuckDuckGo fallback
 Output  : UK_Leads.xlsx + optional CRM
 
-Environment variables (Railway -> Variables):
+Environment variables (Railway -> Variables, or set in your terminal when running locally):
   CRM_API_KEY   your CRM API key (required for CRM sync)
   CRM_API_URL   optional, overrides the CRM endpoint
   DATA_DIR      optional, folder for the Excel file (set to /data when a Volume is mounted there)
   PORT          set by Railway automatically
 
-Run locally:
+Run locally (Windows PowerShell):
   pip install flask pandas openpyxl requests playwright
   playwright install chromium
+  $env:CRM_API_KEY="f33f43afb069e63f3ab24b0ee3d121275736ccae9531ef54"
   python leads_scraper.py
   -> http://127.0.0.1:5000
 """
@@ -462,6 +463,11 @@ DEBUG_SHOT = os.path.join(DATA_DIR, "debug.png")
 DELAY = 5
 SAVE_EVERY = 5
 
+# Page loading: longer timeout + retries so one slow Google Maps page does not skip the place
+NAV_TIMEOUT = 45000          # ms for each page.goto attempt
+NAV_RETRIES = 2              # extra attempts after the first one
+BLOCK_HEAVY_RESOURCES = True # do not load images / media / fonts (much faster pages)
+
 
 ONLY_WITH_CONTACT = True
 
@@ -473,7 +479,7 @@ FALLBACK_MAX_RESULTS = 15
 
 API_ENABLED = True
 API_URL = os.getenv("CRM_API_URL", "https://crm.rhoflow.net/api/external/leads")
-API_KEY = os.getenv("CRM_API_KEY", "").strip()       # set CRM_API_KEY in Railway Variables
+API_KEY = os.getenv("CRM_API_KEY", "f33f43afb069e63f3ab24b0ee3d121275736ccae9531ef54").strip()
 API_KEY_HEADER = "X-API-Key"
 PAYLOAD_MODE = "single"
 
@@ -539,6 +545,25 @@ def clean(text):
     if not text:
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def short_err(e):
+    """First line of a Playwright error, without the long 'Call log' part."""
+    return clean(str(e).split("Call log")[0])[:110]
+
+
+def safe_goto(page, url, timeout=None, retries=None, wait_until="domcontentloaded"):
+    """page.goto with a longer timeout and retries. Raises only after all attempts fail."""
+    timeout = timeout or NAV_TIMEOUT
+    retries = NAV_RETRIES if retries is None else retries
+    for attempt in range(retries + 1):
+        try:
+            page.goto(url, timeout=timeout, wait_until=wait_until)
+            return
+        except Exception:
+            if attempt >= retries:
+                raise
+            time.sleep(2 + attempt * 2)
 
 
 STRICT_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,24}$")
@@ -977,7 +1002,7 @@ def get_socials(page, website):
     if not website or not website.startswith("http"):
         return data
     try:
-        page.goto(website, timeout=15000, wait_until="domcontentloaded")
+        safe_goto(page, website, timeout=20000, retries=1)
         time.sleep(2)
         for a in page.locator("a[href]").all():
             try:
@@ -1277,7 +1302,7 @@ def web_fallback(page, service, city, seen_ids, seen_keys, industry=""):
             seen_keys.add(key)
             print(f"   🔎 📞 NO-WEBSITE {name[:40]} | {phone or '-'} | {email or '-'}")
         except Exception as e:
-            print(f"   🔎 ❌ error: {str(e)[:80]}")
+            print(f"   🔎 ❌ {short_err(e)}")
             continue
     return leads
 
@@ -1290,7 +1315,7 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
     completed = False
     try:
         url = f"https://www.google.com/maps/search/{quote(query)}"
-        page.goto(url, timeout=60000, wait_until="domcontentloaded")
+        safe_goto(page, url, timeout=60000)
         time.sleep(4)
         _accept_consent(page)
 
@@ -1315,7 +1340,7 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
 
         print(f"   Found {len(places)} places")
         if not places:
-            # Diagnostic: what did Google actually show? (open /debug on the web page to see the screenshot)
+            # Diagnostic: what did Google actually show? (open /debug.png on the web page to see the screenshot)
             try:
                 print(f"   ⚠️ No places. URL: {page.url[:90]} | Title: {page.title()[:60]}")
                 page.screenshot(path=DEBUG_SHOT)
@@ -1329,10 +1354,10 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
             if pid in seen_ids:
                 continue
             try:
-                page.goto(place_url, timeout=20000, wait_until="domcontentloaded")
+                safe_goto(page, place_url)
 
                 try:
-                    page.wait_for_selector("h1", timeout=8000)
+                    page.wait_for_selector("h1", timeout=10000)
                     name = clean(page.locator("h1").first.inner_text(timeout=5000))
                 except Exception:
                     print(f"   [{i+1}] ⚠️ page did not load, skipped")
@@ -1439,13 +1464,13 @@ def scrape(page, query, location, seen_ids, seen_keys, industry=""):
                     saved_upto = len(leads)
 
             except Exception as e:
-                print(f"   [{i+1}] ❌ error: {str(e)[:80]}")
+                print(f"   [{i+1}] ❌ {short_err(e)}")
                 continue
 
         completed = bool(places) and not _job.get("stop")
 
     except Exception as e:
-        print(f"❌ Failed: {str(e)[:80]}")
+        print(f"❌ Failed: {short_err(e)}")
 
     if saved_upto < len(leads):
         save_leads(leads[saved_upto:])
@@ -1503,6 +1528,18 @@ def run_scrape_job():
                 user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                             "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
             )
+            context.set_default_navigation_timeout(60000)
+            context.set_default_timeout(30000)
+            if BLOCK_HEAVY_RESOURCES:
+                def _block_heavy(route):
+                    try:
+                        if route.request.resource_type in ("image", "media", "font"):
+                            route.abort()
+                        else:
+                            route.continue_()
+                    except Exception:
+                        pass
+                context.route("**/*", _block_heavy)
             page = context.new_page()
             page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             job_print("✅ Browser ready, starting searches...")
@@ -1561,86 +1598,289 @@ def run_scrape_job():
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "leads-scraper-key")
 
-PAGE = """
+PAGE = r"""
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <title>Leads Scraper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-body{font-family:system-ui,sans-serif;max-width:720px;margin:1.5rem auto;padding:0 1rem;background:#f4f6fa;color:#111}
-.card{background:#fff;border-radius:10px;padding:1.25rem;box-shadow:0 2px 10px rgba(0,0,0,.06);margin-bottom:1rem}
-h1{font-size:1.3rem;margin:0 0 .5rem;color:#1e40af}
-label{display:block;margin:.7rem 0 .25rem;font-weight:600;font-size:.9rem}
-.row{display:flex;flex-wrap:wrap;gap:.5rem 1rem;font-size:.88rem}
-.row label{font-weight:400;margin:0}
-input[type=text]{width:100%;padding:.5rem;border:1px solid #ddd;border-radius:6px}
-button,.btn{background:#1e40af;color:#fff;border:none;border-radius:8px;padding:.65rem 1.1rem;font-weight:600;cursor:pointer;text-decoration:none;display:inline-block}
-button.sec,.btn.sec{background:#e2e8f0;color:#111}
-button:disabled{opacity:.5}
-#log{background:#0f172a;color:#e2e8f0;font:12px/1.4 ui-monospace,monospace;padding:1rem;border-radius:8px;max-height:420px;overflow:auto;white-space:pre-wrap}
-.flash{padding:.6rem 1rem;border-radius:8px;margin-bottom:.8rem;background:#ecfdf5;color:#047857}
-.flash.err{background:#fef2f2;color:#b91c1c}
+:root{
+  --ground:#EDF0EB; --panel:#FFFFFF; --ink:#16211C; --muted:#5C6A63; --line:#D8DFD6;
+  --brand:#0E6B50; --brand-dark:#0A523D; --tint:#E1F0E8;
+  --warn:#B7791F; --bad:#B42318; --console:#0F1A17; --console-line:#22332D;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--ground);color:var(--ink);overflow-x:hidden;
+  font:15px/1.5 "Instrument Sans",system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:900px;margin:0 auto;padding:28px 20px 56px}
+header.top{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:22px;flex-wrap:wrap}
+header.top h1{margin:0;font-size:1.55rem;font-weight:700;letter-spacing:-.02em}
+header.top p{margin:2px 0 0;color:var(--muted);font-size:.9rem}
+nav.tabs{display:flex;gap:4px;background:#DFE5DD;padding:4px;border-radius:12px}
+nav.tabs a{padding:7px 16px;border-radius:9px;color:var(--muted);text-decoration:none;font-weight:600;font-size:.9rem;text-align:center}
+nav.tabs a.on{background:var(--panel);color:var(--ink);box-shadow:0 1px 2px rgba(22,33,28,.12)}
+nav.tabs a:focus-visible,.btn:focus-visible,button:focus-visible{outline:3px solid #7FC4A8;outline-offset:2px}
+.opt input:focus-visible+span{outline:3px solid #7FC4A8;outline-offset:2px}
+
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:22px 24px;margin-bottom:16px}
+.panel h2{margin:0 0 4px;font-size:1rem;font-weight:700}
+.panel .hint{margin:0 0 14px;color:var(--muted);font-size:.86rem}
+
+.flash{padding:11px 16px;border-radius:12px;margin-bottom:14px;background:var(--tint);color:var(--brand-dark);font-weight:500}
+.flash.err{background:#FDECEA;color:var(--bad)}
+
+/* option chips: checkbox/radio sit invisibly on top of the label text */
+.opts{display:flex;flex-wrap:wrap;gap:8px}
+.opt{position:relative;cursor:pointer;max-width:100%}
+.opt input{position:absolute;opacity:0;inset:0;width:100%;height:100%;margin:0;cursor:pointer}
+.opt span{display:inline-block;max-width:100%;padding:8px 14px;border:1px solid var(--line);border-radius:999px;background:#FAFBF9;
+  font-size:.9rem;font-weight:500;transition:background .12s,border-color .12s,color .12s}
+.opt:hover span{border-color:#B6C4B9}
+.opt input:checked+span{background:var(--brand);border-color:var(--brand);color:#fff}
+.opts.big .opt span{border-radius:12px;padding:12px 18px;font-size:.95rem}
+
+.field{width:100%;margin-top:12px;padding:11px 14px;border:1px solid var(--line);border-radius:10px;
+  font:inherit;font-size:16px;background:#FAFBF9;color:var(--ink)}
+.field:focus{outline:3px solid #7FC4A8;outline-offset:1px;border-color:var(--brand)}
+#customBox{display:none}
+#customBox.show{display:block}
+
+.actions{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:6px}
+button,.btn{font:inherit;font-weight:600;border:1px solid transparent;border-radius:10px;padding:11px 20px;
+  cursor:pointer;text-decoration:none;display:inline-block;line-height:1.2;text-align:center}
+.btn.primary,button.primary{background:var(--brand);color:#fff}
+.btn.primary:hover,button.primary:hover{background:var(--brand-dark)}
+.btn.ghost,button.ghost{background:var(--panel);color:var(--ink);border-color:var(--line)}
+.btn.ghost:hover,button.ghost:hover{border-color:#B6C4B9}
+button.danger{background:#FDECEA;color:var(--bad);border-color:#F4C7C2}
+button:disabled{opacity:.45;cursor:not-allowed}
+
+/* status */
+.state{display:flex;align-items:center;gap:10px;font-weight:700;font-size:1.1rem}
+.dot{width:11px;height:11px;border-radius:50%;background:#9AA7A0;flex:none}
+.dot.run{background:var(--brand);animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(14,107,80,.45)}50%{box-shadow:0 0 0 7px rgba(14,107,80,0)}}
+@media (prefers-reduced-motion:reduce){.dot.run{animation:none}.bar i{transition:none}}
+.summary{color:var(--muted);margin:6px 0 18px;font-size:.9rem;overflow-wrap:anywhere}
+.bar{height:10px;background:#E4E9E2;border-radius:999px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--brand);border-radius:999px;transition:width .6s ease}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:18px 0}
+.stat{background:#F6F8F5;border:1px solid var(--line);border-radius:12px;padding:12px 16px;min-width:0}
+.stat b{display:block;font-size:1.65rem;line-height:1.15;letter-spacing:-.02em}
+.stat small{color:var(--muted);font-size:.82rem}
+.err-box{background:#FDECEA;color:var(--bad);border-radius:12px;padding:10px 14px;margin-bottom:14px;display:none;overflow-wrap:anywhere}
+
+.console{background:var(--console);border-radius:18px;overflow:hidden;margin-top:16px}
+.console .bar2{display:flex;justify-content:space-between;align-items:center;padding:10px 18px;
+  border-bottom:1px solid var(--console-line);color:#8FA79C;font-size:.82rem}
+#log{font:12.5px/1.6 "JetBrains Mono",ui-monospace,Consolas,monospace;color:#D5E3DC;padding:14px 18px;
+  height:440px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-overflow-scrolling:touch}
+#log div{padding:0 0 0 10px;border-left:2px solid transparent}
+#log .ok{color:#7FE0B0}
+#log .warn{color:#F2C26B}
+#log .bad{color:#FF8D82;border-left-color:#FF8D82}
+#log .q{color:#fff;font-weight:500;margin-top:8px}
+
+/* ---------- mobile ---------- */
+@media (max-width:640px){
+  body{font-size:15px}
+  .wrap{padding:16px 14px calc(40px + env(safe-area-inset-bottom))}
+  header.top{flex-direction:column;align-items:stretch;gap:12px;margin-bottom:16px}
+  header.top h1{font-size:1.35rem}
+  nav.tabs{width:100%}
+  nav.tabs a{flex:1;padding:9px 10px}
+  .panel{padding:16px 14px;border-radius:14px;margin-bottom:12px}
+  .opts{gap:7px}
+  .opt span{padding:9px 13px;font-size:.88rem}
+  .opts.big{flex-direction:column}
+  .opts.big .opt span{display:block;width:100%;text-align:center}
+  .stats{gap:8px}
+  .stat{padding:10px 10px}
+  .stat b{font-size:1.3rem}
+  .stat small{font-size:.76rem}
+  .actions{gap:8px}
+  .actions .btn,.actions button{flex:1 1 calc(50% - 8px);padding:12px 10px}
+  .actions form{display:contents}
+  .actions.sticky{position:sticky;bottom:0;z-index:5;margin:0 -14px;padding:10px 14px calc(10px + env(safe-area-inset-bottom));
+    background:rgba(237,240,235,.96);border-top:1px solid var(--line)}
+  .actions.sticky .primary{flex-basis:100%}
+  .console{border-radius:14px}
+  .console .bar2{padding:9px 14px}
+  #log{height:55vh;min-height:280px;padding:12px 12px;font-size:11.5px}
+}
+@media (max-width:360px){
+  .stats{grid-template-columns:1fr}
+}
 </style></head><body>
-<h1>Leads Scraper</h1>
+<div class="wrap">
+
+<header class="top">
+  <div>
+    <h1>Leads Scraper</h1>
+    <p>Find businesses on Google Maps and save their contact details</p>
+  </div>
+  <nav class="tabs">
+    <a href="{{ url_for('index') }}" class="{% if page=='form' %}on{% endif %}">Setup</a>
+    <a href="{{ url_for('status') }}" class="{% if page!='form' %}on{% endif %}">Status</a>
+  </nav>
+</header>
+
 {% with msgs = get_flashed_messages(with_categories=1) %}
   {% for c,m in msgs %}<div class="flash {% if c=='error' %}err{% endif %}">{{ m }}</div>{% endfor %}
 {% endwith %}
 
 {% if page=='form' %}
-<div class="card">
 <form method="post" action="{{ url_for('start') }}">
-  <label>1) Lead type</label>
-  <div class="row">
-    <label><input type="radio" name="lead_type" value="1" checked> Without website</label>
-    <label><input type="radio" name="lead_type" value="2"> With website</label>
+
+  <section class="panel">
+    <h2>Lead type</h2>
+    <p class="hint">Which businesses do you want to collect?</p>
+    <div class="opts big">
+      <label class="opt"><input type="radio" name="lead_type" value="1" checked><span>Without a website</span></label>
+      <label class="opt"><input type="radio" name="lead_type" value="2"><span>With a website</span></label>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Regions</h2>
+    <p class="hint">Pick one or more countries to search.</p>
+    <div class="opts">
+      {% for r in regions %}
+      <label class="opt"><input type="checkbox" name="regions" value="{{ r }}" {% if r=='UK' %}checked{% endif %}><span>{{ r }}</span></label>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Industries</h2>
+    <p class="hint">Each industry searches several related business types.</p>
+    <div class="opts">
+      {% for k,v in industries.items() %}
+      <label class="opt"><input type="checkbox" name="industries" value="{{ k }}" {% if k=='1' %}checked{% endif %}><span>{{ v[0] }}</span></label>
+      {% endfor %}
+      <label class="opt"><input type="checkbox" name="industries" value="14" id="customToggle"><span>Custom</span></label>
+    </div>
+    <div id="customBox">
+      <input class="field" type="text" name="custom_terms" placeholder="Separate with commas: dentist, orthodontist, ...">
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Services you offer</h2>
+    <p class="hint">Saved in each lead's notes.</p>
+    <div class="opts">
+      {% for k,v in services.items() %}
+      <label class="opt"><input type="checkbox" name="offers" value="{{ k }}" checked><span>{{ v }}</span></label>
+      {% endfor %}
+    </div>
+  </section>
+
+  <div class="actions sticky">
+    <button class="primary" type="submit" {% if running %}disabled{% endif %}>Start scrape</button>
+    {% if running %}<a class="btn ghost" href="{{ url_for('status') }}">View running scrape</a>{% endif %}
+    {% if excel %}<a class="btn ghost" href="{{ url_for('download') }}">Download Excel</a>{% endif %}
   </div>
-  <label>2) Regions</label>
-  <div class="row">
-    {% for r in regions %}<label><input type="checkbox" name="regions" value="{{ r }}" {% if r=='UK' %}checked{% endif %}> {{ r }}</label>{% endfor %}
-  </div>
-  <label>3) Industries</label>
-  <div class="row">
-    {% for k,v in industries.items() %}<label><input type="checkbox" name="industries" value="{{ k }}" {% if k=='1' %}checked{% endif %}> {{ v[0] }}</label>{% endfor %}
-    <label><input type="checkbox" name="industries" value="14"> Custom</label>
-  </div>
-  <input type="text" name="custom_terms" placeholder="Custom terms: dentist, orthodontist, ...">
-  <label>4) Services you offer</label>
-  <div class="row">
-    {% for k,v in services.items() %}<label><input type="checkbox" name="offers" value="{{ k }}" checked> {{ v }}</label>{% endfor %}
-  </div>
-  <p style="margin-top:1rem">
-    <button type="submit" {% if running %}disabled{% endif %}>Start scrape</button>
-    <a class="btn sec" href="{{ url_for('status') }}">Status</a>
-    {% if excel %}<a class="btn sec" href="{{ url_for('download') }}">Download Excel</a>{% endif %}
-  </p>
 </form>
-</div>
-{% else %}
-<div class="card">
-  <p><b id="st">{{ 'RUNNING' if running else 'IDLE' }}</b> — {{ summary }}</p>
-  <p>Saved: <span id="sv">{{ stats.saved }}</span> | Queries: <span id="qd">{{ stats.queries_done }}</span>/<span id="qt">{{ stats.queries_total }}</span></p>
-  <p>
-    {% if running %}<form method="post" action="{{ url_for('stop') }}" style="display:inline"><button class="sec" type="submit">Stop</button></form>{% endif %}
-    <a class="btn sec" href="{{ url_for('index') }}">Setup</a>
-    {% if excel %}<a class="btn" href="{{ url_for('download') }}">Download Excel</a>{% endif %}
-    {% if debug_shot %}<a class="btn sec" href="{{ url_for('debug_png') }}" target="_blank">Debug screenshot</a>{% endif %}
-  </p>
-  <div id="log">{{ log }}</div>
-</div>
 <script>
-function poll(){fetch("{{ url_for('api_status') }}").then(r=>r.json()).then(d=>{
-  var el=document.getElementById("log");
-  var atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-40;
-  el.textContent=d.log.join("\\n");
-  if(atEnd) el.scrollTop=el.scrollHeight;
-  document.getElementById("st").textContent=d.running?"RUNNING":"IDLE";
-  document.getElementById("sv").textContent=d.stats.saved;
-  document.getElementById("qd").textContent=d.stats.queries_done;
-  document.getElementById("qt").textContent=d.stats.queries_total;
-  setTimeout(poll,3000);
-}).catch(()=>setTimeout(poll,5000));}
+(function(){
+  var t=document.getElementById("customToggle"), b=document.getElementById("customBox");
+  function sync(){ b.classList.toggle("show", t.checked); }
+  t.addEventListener("change", sync); sync();
+})();
+</script>
+
+{% else %}
+<section class="panel">
+  <div class="state"><span class="dot {% if running %}run{% endif %}" id="dot"></span><span id="st">{{ 'Running' if running else 'Idle' }}</span></div>
+  <p class="summary">{{ summary }}</p>
+
+  <div class="err-box" id="errbox"></div>
+
+  <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+       aria-valuenow="{{ ((stats.queries_done / stats.queries_total * 100) if stats.queries_total else 0)|round|int }}">
+    <i id="bar" style="width:{{ ((stats.queries_done / stats.queries_total * 100) if stats.queries_total else 0) }}%"></i>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><b id="sv">{{ stats.saved }}</b><small>Leads saved</small></div>
+    <div class="stat"><b id="qd">{{ stats.queries_done }}</b><small>Searches done</small></div>
+    <div class="stat"><b id="qt">{{ stats.queries_total }}</b><small>Searches total</small></div>
+  </div>
+
+  <div class="actions">
+    {% if running %}
+    <form method="post" action="{{ url_for('stop') }}" style="display:inline"><button class="danger" type="submit">Stop scrape</button></form>
+    {% endif %}
+    <a class="btn ghost" href="{{ url_for('index') }}">Change setup</a>
+    {% if excel %}<a class="btn primary" href="{{ url_for('download') }}">Download Excel</a>{% endif %}
+    {% if debug_shot %}<a class="btn ghost" href="{{ url_for('debug_png') }}" target="_blank">Debug screenshot</a>{% endif %}
+  </div>
+</section>
+
+<div class="console">
+  <div class="bar2"><span>Live log</span><span id="pct"></span></div>
+  <div id="log"></div>
+</div>
+
+<script>
+var INITIAL = {{ log|tojson }};
+
+function lineClass(l){
+  if (/❌|Fatal/.test(l)) return "bad";
+  if (/⚠️/.test(l)) return "warn";
+  if (/💾|📡|✅|NO-WEBSITE|HAS-WEBSITE/.test(l)) return "ok";
+  if (/^\s*🔍 \[/.test(l)) return "q";
+  return "";
+}
+
+function renderLog(lines){
+  var el = document.getElementById("log");
+  var atEnd = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
+  var frag = document.createDocumentFragment();
+  lines.forEach(function(l){
+    var d = document.createElement("div");
+    d.textContent = l === "" ? "\u00a0" : l;
+    var c = lineClass(l); if (c) d.className = c;
+    frag.appendChild(d);
+  });
+  el.replaceChildren(frag);
+  if (atEnd) el.scrollTop = el.scrollHeight;
+}
+
+function setStats(d){
+  var done = d.stats.queries_done, total = d.stats.queries_total;
+  var pct = total ? Math.min(100, done / total * 100) : 0;
+  document.getElementById("sv").textContent = d.stats.saved;
+  document.getElementById("qd").textContent = done;
+  document.getElementById("qt").textContent = total;
+  document.getElementById("bar").style.width = pct + "%";
+  document.getElementById("pct").textContent = total ? pct.toFixed(1) + "% of searches" : "";
+  document.getElementById("st").textContent = d.running ? "Running" : "Idle";
+  document.getElementById("dot").className = "dot" + (d.running ? " run" : "");
+  var eb = document.getElementById("errbox");
+  if (d.error){ eb.textContent = d.error; eb.style.display = "block"; } else { eb.style.display = "none"; }
+}
+
+renderLog(INITIAL.split("\n"));
+document.getElementById("log").scrollTop = 1e9;
+
+function poll(){
+  fetch("{{ url_for('api_status') }}").then(function(r){return r.json();}).then(function(d){
+    setStats(d);
+    renderLog(d.log);
+    setTimeout(poll, 3000);
+  }).catch(function(){ setTimeout(poll, 5000); });
+}
 poll();
 </script>
 {% endif %}
+
+</div>
 </body></html>
 """
 
